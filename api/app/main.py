@@ -167,6 +167,22 @@ async def health() -> dict[str, str]:
     return {"ok": True, "service": "api"}
 
 
+@app.get("/model-profiles")
+async def list_model_profiles(current_user: User = Depends(get_current_user)) -> dict:
+    """Returns the model_profile -> [primary, fallback] mapping so the builder UI
+    can show real OpenRouter model names instead of abstract profile slugs."""
+    return {
+        "profiles": [
+            {
+                "slug": slug,
+                "primary": models[0] if len(models) > 0 else None,
+                "fallback": models[1] if len(models) > 1 else None,
+            }
+            for slug, models in settings.model_profiles.items()
+        ]
+    }
+
+
 @app.get("/health/db")
 async def health_db(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
     try:

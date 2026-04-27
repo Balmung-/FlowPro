@@ -9,6 +9,8 @@ import { ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 
 import {
+  ModelProfile,
+  ModelProfilesResponse,
   NodeOutputFormat,
   Template,
   TemplateConfig,
@@ -19,7 +21,20 @@ import {
 } from "@/lib/api";
 import { getStoredToken } from "@/lib/auth";
 
-const MODEL_PROFILES = ["fast_classifier", "json_extractor", "premium_writer", "deep_reasoner"];
+const PROFILE_LABELS: Record<string, string> = {
+  fast_classifier: "Fast Classifier",
+  json_extractor: "JSON Extractor",
+  premium_writer: "Premium Writer",
+  deep_reasoner: "Deep Reasoner",
+};
+
+const PROFILE_DESCRIPTIONS: Record<string, string> = {
+  fast_classifier: "Cheap, fast model for routing/classification tasks.",
+  json_extractor: "Strong at producing structured JSON output.",
+  premium_writer: "Top-tier writing model for outlines, drafts, final polish.",
+  deep_reasoner: "Reasoning-heavy model for QA, planning, and judgment calls.",
+};
+
 const ALL_VIEWERS: ViewerKind[] = ["markdown", "pdf", "json", "raw"];
 
 function slugifyId(value: string): string {
@@ -116,6 +131,7 @@ export default function TemplateBuilderPage() {
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
 
   const isSeeded = template?.is_seeded === true;
   const readOnly = isSeeded;
@@ -126,6 +142,10 @@ export default function TemplateBuilderPage() {
       router.replace("/login");
       return;
     }
+    apiFetch<ModelProfilesResponse>("/model-profiles")
+      .then((res) => setModelProfiles(res.profiles))
+      .catch(() => undefined);
+
     if (isNew) {
       setConfig({ ...EMPTY_CONFIG, nodes: [] });
       setLoading(false);
@@ -449,6 +469,7 @@ export default function TemplateBuilderPage() {
             <NodePropertiesPanel
               node={selectedNode}
               upstreamReadOptions={upstreamReadOptions}
+              modelProfiles={modelProfiles}
               readOnly={readOnly}
               isFirst={config.nodes[0]?.id === selectedNode.id}
               isLast={config.nodes[config.nodes.length - 1]?.id === selectedNode.id}
@@ -542,6 +563,7 @@ function TemplatePropertiesPanel({
 function NodePropertiesPanel({
   node,
   upstreamReadOptions,
+  modelProfiles,
   readOnly,
   isFirst,
   isLast,
@@ -553,6 +575,7 @@ function NodePropertiesPanel({
 }: {
   node: TemplateNodeConfig;
   upstreamReadOptions: string[];
+  modelProfiles: ModelProfile[];
   readOnly: boolean;
   isFirst: boolean;
   isLast: boolean;
@@ -563,6 +586,7 @@ function NodePropertiesPanel({
   onDelete: () => void;
 }) {
   const isAi = node.type === "ai" || node.type === "plan";
+  const isPdf = node.type === "pdf_generator";
   const toggleRead = (ref: string) => {
     if (readOnly) return;
     const next = new Set(node.reads);
@@ -570,6 +594,17 @@ function NodePropertiesPanel({
     else next.add(ref);
     onChange({ reads: Array.from(next) });
   };
+
+  const profileFallback: ModelProfile[] = modelProfiles.length
+    ? modelProfiles
+    : [
+        { slug: "fast_classifier", primary: null, fallback: null },
+        { slug: "json_extractor", primary: null, fallback: null },
+        { slug: "premium_writer", primary: null, fallback: null },
+        { slug: "deep_reasoner", primary: null, fallback: null },
+      ];
+  const activeProfile = profileFallback.find((p) => p.slug === node.model_profile);
+
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
       <div className="border-b border-slate-200 bg-white px-5 py-4">
@@ -605,10 +640,17 @@ function NodePropertiesPanel({
             </button>
           </div>
         </div>
+        <p className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-[11px] leading-snug text-slate-600">
+          {isAi
+            ? "This node calls an AI model with the prompts below, then writes its result to a file other nodes can read."
+            : isPdf
+              ? "This node converts a markdown file produced by an upstream node into a PDF. No AI call."
+              : "Custom node."}
+        </p>
       </div>
 
       <div className="flex flex-1 flex-col gap-4 px-5 py-4">
-        <Field label="Name">
+        <Field label="Name" hint="What you'll see this node called in the canvas and chat history.">
           <input
             className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
             value={node.name}
@@ -619,22 +661,38 @@ function NodePropertiesPanel({
 
         {isAi ? (
           <>
-            <Field label="Model profile">
+            <Field
+              label="OpenRouter model"
+              hint={
+                activeProfile?.primary
+                  ? `Currently uses ${activeProfile.primary}${activeProfile.fallback ? ` (falls back to ${activeProfile.fallback})` : ""}. Pick the profile best suited to this node's task.`
+                  : "Pick the model profile best suited for this node's task."
+              }
+            >
               <select
                 className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
                 value={node.model_profile ?? ""}
                 disabled={readOnly}
                 onChange={(event) => onChange({ model_profile: event.target.value })}
               >
-                {MODEL_PROFILES.map((p) => (
-                  <option key={p} value={p}>
-                    {p}
+                {profileFallback.map((p) => (
+                  <option key={p.slug} value={p.slug}>
+                    {PROFILE_LABELS[p.slug] ?? p.slug}
+                    {p.primary ? ` — ${p.primary}` : ""}
                   </option>
                 ))}
               </select>
+              {activeProfile && PROFILE_DESCRIPTIONS[activeProfile.slug] ? (
+                <p className="mt-1 text-[10px] italic text-slate-400">
+                  {PROFILE_DESCRIPTIONS[activeProfile.slug]}
+                </p>
+              ) : null}
             </Field>
 
-            <Field label="System prompt">
+            <Field
+              label="System prompt"
+              hint="Persistent instructions sent to the model on every call (e.g., 'You are a careful proposal writer. Only output markdown.')."
+            >
               <textarea
                 className="min-h-[80px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
                 value={node.system_prompt}
@@ -645,7 +703,7 @@ function NodePropertiesPanel({
 
             <Field
               label="User prompt template"
-              hint="Use ${message}, ${uploaded_files}, and ${section_key} for declared reads."
+              hint="The actual message sent to the model. Inject runtime data with placeholders: ${message} = the user's chat input, ${uploaded_files} = JSON list of project uploads, ${working_intent} (or any ${section_key}) = output from a node you declared in Reads."
             >
               <textarea
                 className="min-h-[120px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs"
@@ -661,8 +719,8 @@ function NodePropertiesPanel({
           label="Reads"
           hint={
             upstreamReadOptions.length === 0
-              ? "No upstream nodes yet — add nodes above this one."
-              : "Pick which upstream outputs this node consumes."
+              ? "No upstream nodes yet — add nodes above this one. Reads are how a node consumes the output of an earlier node."
+              : "Tick which upstream nodes' outputs this node should read. Each ticked entry becomes a ${section_key} variable you can use in the prompt template."
           }
         >
           <div className="flex flex-wrap gap-1.5">
@@ -690,8 +748,15 @@ function NodePropertiesPanel({
 
         <div className="rounded-xl border border-slate-200 bg-white p-3">
           <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Output</p>
-          <div className="mt-2 grid gap-2">
-            <Field label="Format">
+          <p className="mt-1 text-[10px] text-slate-500">
+            What this node writes when it runs. Each run, the output is saved to the project's
+            cloud storage at the path below, and downstream nodes can read it.
+          </p>
+          <div className="mt-2 grid gap-3">
+            <Field
+              label="Format"
+              hint="json = structured data the model returns as JSON. markdown = readable text/document. pdf = converts an upstream markdown file into a PDF."
+            >
               <select
                 className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
                 value={node.output.format}
@@ -700,12 +765,15 @@ function NodePropertiesPanel({
                   onChangeOutput({ format: event.target.value as NodeOutputFormat })
                 }
               >
-                <option value="json">json</option>
-                <option value="markdown">markdown</option>
-                <option value="pdf">pdf</option>
+                <option value="json">json — structured data</option>
+                <option value="markdown">markdown — readable document</option>
+                <option value="pdf">pdf — printable document</option>
               </select>
             </Field>
-            <Field label="Path" hint="Must start with input/, working/, final/, logs/, or archive/">
+            <Field
+              label="File path"
+              hint="The relative path inside this project's cloud folder. Must start with one of: input/, working/ (intermediate results), final/ (finished outputs), logs/, archive/."
+            >
               <input
                 className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs"
                 value={node.output.path}
@@ -714,7 +782,10 @@ function NodePropertiesPanel({
               />
             </Field>
             <div className="grid grid-cols-2 gap-2">
-              <Field label="State section">
+              <Field
+                label="State section"
+                hint="Bucket name in the run's state object. Convention: 'working' for intermediate, 'final' for end products."
+              >
                 <input
                   className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
                   value={node.output.state_section}
@@ -722,7 +793,10 @@ function NodePropertiesPanel({
                   onChange={(event) => onChangeOutput({ state_section: event.target.value })}
                 />
               </Field>
-              <Field label="State key">
+              <Field
+                label="State key"
+                hint="Name downstream nodes use to read this output. Combined: section.key (e.g. working.intent)."
+              >
                 <input
                   className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
                   value={node.output.state_key}
@@ -731,6 +805,12 @@ function NodePropertiesPanel({
                 />
               </Field>
             </div>
+            <p className="rounded-md bg-slate-50 px-2 py-1.5 font-mono text-[10px] text-slate-600">
+              Downstream nodes can read this as:{" "}
+              <span className="font-semibold">
+                {node.output.state_section}.{node.output.state_key}
+              </span>
+            </p>
           </div>
         </div>
       </div>

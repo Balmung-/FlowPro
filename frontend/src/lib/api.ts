@@ -62,6 +62,16 @@ export type Template = {
   updated_at: string;
 };
 
+export type ModelProfile = {
+  slug: string;
+  primary: string | null;
+  fallback: string | null;
+};
+
+export type ModelProfilesResponse = {
+  profiles: ModelProfile[];
+};
+
 export type ChatMessage = {
   id: string;
   project_id: string;
