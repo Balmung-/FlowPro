@@ -611,11 +611,20 @@ async def clone_template(
 @app.get("/projects/{project_id}/messages")
 async def list_messages(
     project_id: str,
+    run_id: str | None = Query(default=None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
+    """Return chat messages for the project. Pass `run_id` to scope the
+    thread to a single run (the user's request + that run's system/assistant
+    messages) — the workspace uses this so the chat reflects the selected run
+    instead of mixing every run's history into one stream."""
     await get_project_for_user(db, project_id, current_user.id)
-    result = await db.execute(select(ChatMessage).where(ChatMessage.project_id == project_id).order_by(ChatMessage.created_at))
+    statement = select(ChatMessage).where(ChatMessage.project_id == project_id)
+    if run_id:
+        statement = statement.where(ChatMessage.run_id == run_id)
+    statement = statement.order_by(ChatMessage.created_at)
+    result = await db.execute(statement)
     return [serialize_chat_message(item) for item in result.scalars().all()]
 
 
@@ -676,7 +685,7 @@ async def get_run(
 
     artifact_result = await db.execute(select(Artifact).where(Artifact.run_id == run.id, Artifact.deleted_at.is_(None)).order_by(Artifact.created_at))
     event_result = await db.execute(select(RunEvent).where(RunEvent.run_id == run.id).order_by(RunEvent.created_at))
-    execution_result = await db.execute(select(NodeExecution).where(NodeExecution.run_id == run.id).order_by(NodeExecution.node_id))
+    execution_result = await db.execute(select(NodeExecution).where(NodeExecution.run_id == run.id).order_by(NodeExecution.order_index, NodeExecution.node_id))
 
     return {
         **serialize_run(run),
@@ -709,7 +718,7 @@ async def get_node_executions(
     if not run:
         raise HTTPException(status_code=404, detail="Run not found.")
     await get_project_for_user(db, run.project_id, current_user.id)
-    result = await db.execute(select(NodeExecution).where(NodeExecution.run_id == run.id).order_by(NodeExecution.node_id))
+    result = await db.execute(select(NodeExecution).where(NodeExecution.run_id == run.id).order_by(NodeExecution.order_index, NodeExecution.node_id))
     return [serialize_node_execution(item) for item in result.scalars().all()]
 
 

@@ -122,10 +122,20 @@ export default function FileExplorerDrawer({
     return () => document.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  // Logical section: project uploads live at "<section>/...", run artifacts
+  // at "runs/<run_id>/<section>/...". Collapse both to the section name.
+  const fileSection = (path: string): string | null => {
+    if (path.startsWith("runs/")) {
+      const parts = path.split("/");
+      return parts[2] ?? null;
+    }
+    return path.split("/")[0] ?? null;
+  };
+
   const projectFilesFiltered = useMemo(() => {
     let list = projectFiles;
     if (projectGroup !== "all") {
-      list = list.filter((file) => file.path.startsWith(`${projectGroup}/`));
+      list = list.filter((file) => fileSection(file.path) === projectGroup);
     }
     if (search.trim()) {
       const q = search.toLowerCase();
@@ -443,7 +453,7 @@ export default function FileExplorerDrawer({
                       key={g}
                       label={`/${g}`}
                       active={projectGroup === g}
-                      count={projectFiles.filter((f) => f.path.startsWith(`${g}/`)).length}
+                      count={projectFiles.filter((f) => fileSection(f.path) === g).length}
                       onClick={() => setProjectGroup(g)}
                     />
                   ))}

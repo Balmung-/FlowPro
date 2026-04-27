@@ -93,6 +93,9 @@ class NodeExecution(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    # Position of this node in the template, 0-based. Used to render the run in
+    # template order regardless of node_id alphabetic ordering.
+    order_index: Mapped[int] = mapped_column(default=0)
     node_id: Mapped[str] = mapped_column(String(64), index=True)
     node_name: Mapped[str] = mapped_column(String(255))
     node_type: Mapped[str] = mapped_column(String(32))
@@ -219,6 +222,7 @@ def serialize_node_execution(node: NodeExecution) -> dict[str, Any]:
     return {
         "id": node.id,
         "run_id": node.run_id,
+        "order_index": node.order_index,
         "node_id": node.node_id,
         "node_name": node.node_name,
         "node_type": node.node_type,

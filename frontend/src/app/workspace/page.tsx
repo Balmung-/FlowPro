@@ -35,6 +35,7 @@ const STREAM_EVENT_TYPES = [
   "artifact.created",
   "run.completed",
   "run.failed",
+  "run.paused",
 ];
 
 const TAB_KEYS = ["flow", "data", "files", "output", "logs"] as const;
@@ -164,6 +165,17 @@ export default function WorkspacePage() {
     [runs]
   );
 
+  // Extract the *logical* section from an artifact path. Run-scoped artifacts
+  // live at "runs/<run_id>/<section>/...", project-wide ones (uploads) at
+  // "<section>/...". This collapses both shapes to the section name.
+  const logicalSection = useCallback((path: string): string | null => {
+    if (path.startsWith("runs/")) {
+      const parts = path.split("/");
+      return parts[2] ?? null;
+    }
+    return path.split("/")[0] ?? null;
+  }, []);
+
   const filesByGroup = useMemo(() => {
     const grouped = {
       input: [] as Artifact[],
@@ -173,23 +185,43 @@ export default function WorkspacePage() {
       archive: [] as Artifact[],
     };
     for (const artifact of files) {
-      const group = artifact.path.split("/")[0] as keyof typeof grouped;
-      if (group in grouped) grouped[group].push(artifact);
+      // Files tab in the inspector is run-scoped — only show the selected
+      // run's artifacts (plus project uploads in input/, which aren't tied
+      // to any run).
+      const isProjectUpload = artifact.run_id === null;
+      const isThisRun = selectedRunId && artifact.run_id === selectedRunId;
+      if (!isProjectUpload && !isThisRun) continue;
+      const section = logicalSection(artifact.path);
+      if (section && section in grouped) {
+        grouped[section as keyof typeof grouped].push(artifact);
+      }
     }
     return grouped;
-  }, [files]);
+  }, [files, selectedRunId, logicalSection]);
 
   const activeRunArtifacts = useMemo(
     () => (selectedRun?.artifacts ?? []).filter((artifact) => artifact.deleted_at === null),
     [selectedRun]
   );
+  // Resolve the run's final outputs by filename suffix. Path is
+  // runs/<run_id>/final/output.md (new) or final/output.md (legacy pre-immutability).
   const latestMarkdownArtifact = useMemo(
-    () => activeRunArtifacts.find((artifact) => artifact.path === "final/output.md") ?? null,
-    [activeRunArtifacts]
+    () =>
+      activeRunArtifacts.find(
+        (artifact) =>
+          artifact.run_id === selectedRunId &&
+          (artifact.path === "final/output.md" || artifact.path.endsWith("/final/output.md"))
+      ) ?? null,
+    [activeRunArtifacts, selectedRunId]
   );
   const latestPdfArtifact = useMemo(
-    () => activeRunArtifacts.find((artifact) => artifact.path === "final/output.pdf") ?? null,
-    [activeRunArtifacts]
+    () =>
+      activeRunArtifacts.find(
+        (artifact) =>
+          artifact.run_id === selectedRunId &&
+          (artifact.path === "final/output.pdf" || artifact.path.endsWith("/final/output.pdf"))
+      ) ?? null,
+    [activeRunArtifacts, selectedRunId]
   );
 
   const nodeExecutions = useMemo(
@@ -232,6 +264,9 @@ export default function WorkspacePage() {
     });
   }, []);
 
+  // Heavy refresh: pulls every project-scoped collection. Used on first load
+  // of a project, after creating a run, after uploading/deleting files. NOT
+  // used during live SSE streaming (which uses lighter targeted refreshes).
   const loadProjectData = useCallback(
     async (projectId: string, preferredRunId?: string) => {
       if (!projectId) {
@@ -242,12 +277,10 @@ export default function WorkspacePage() {
         setSelectedRun(null);
         return;
       }
-      const [nextMessages, nextFiles, nextRuns] = await Promise.all([
-        apiFetch<ChatMessage[]>(`/projects/${projectId}/messages`),
+      const [nextFiles, nextRuns] = await Promise.all([
         apiFetch<Artifact[]>(`/projects/${projectId}/files`),
         apiFetch<Run[]>(`/projects/${projectId}/runs`),
       ]);
-      setMessages(nextMessages);
       setFiles(nextFiles);
       setRuns(nextRuns);
       const runIdToSelect =
@@ -262,9 +295,30 @@ export default function WorkspacePage() {
       } else {
         setSelectedRun(null);
       }
+      // Chat thread is run-scoped; load it via the dedicated effect that
+      // re-runs whenever selectedRunId changes (see below).
+      if (!runIdToSelect) {
+        setMessages([]);
+      }
     },
     [loadRunDetail, selectedRunId]
   );
+
+  // Light refresh: just the runs list. Called on terminal SSE events so the
+  // sidebar reflects the latest status without re-fetching files/messages.
+  const refreshRunsList = useCallback(async (projectId: string) => {
+    if (!projectId) return;
+    const nextRuns = await apiFetch<Run[]>(`/projects/${projectId}/runs`);
+    setRuns(nextRuns);
+  }, []);
+
+  // Light refresh: project files (used after a run completes so the Files
+  // tab and the explorer drawer pick up newly-written artifacts).
+  const refreshProjectFiles = useCallback(async (projectId: string) => {
+    if (!projectId) return;
+    const nextFiles = await apiFetch<Artifact[]>(`/projects/${projectId}/files`);
+    setFiles(nextFiles);
+  }, []);
 
   const loadArtifactPreview = useCallback(async (artifact: Artifact) => {
     setPreviewArtifactId(artifact.id);
@@ -336,6 +390,27 @@ export default function WorkspacePage() {
     }
   }, [templateNodes, selectedNodeId]);
 
+  // Run-scoped chat: whenever the selected run changes, refetch the messages
+  // for that run only. The center pane therefore reflects the same run as
+  // the right inspector — no more cross-run conversation soup.
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setMessages([]);
+      return;
+    }
+    if (!selectedRunId) {
+      setMessages([]);
+      return;
+    }
+    apiFetch<ChatMessage[]>(
+      `/projects/${selectedProjectId}/messages?run_id=${encodeURIComponent(selectedRunId)}`
+    )
+      .then(setMessages)
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : "Failed to load chat for this run.");
+      });
+  }, [selectedProjectId, selectedRunId]);
+
   // SSE for the selected run.
   useEffect(() => {
     if (!selectedProjectId || !selectedRunId) {
@@ -355,18 +430,50 @@ export default function WorkspacePage() {
     );
     eventSourceRef.current = source;
 
+    const TERMINAL_EVENTS = new Set([
+      "run.completed",
+      "run.failed",
+      "run.cancelled",
+      "run.paused",
+    ]);
+
     const handleStreamMessage = (event: MessageEvent<string>) => {
       try {
         const payload = JSON.parse(event.data) as RunEvent;
         if (seenEventIdsRef.current.has(payload.id)) return;
         seenEventIdsRef.current.add(payload.id);
+
+        // Optimistically append the event to the in-memory run detail so
+        // the Logs tab updates instantly; the next loadRunDetail will
+        // dedupe on event.id.
         setSelectedRun((current) =>
           !current || current.id !== selectedRunId || current.events.some((item) => item.id === payload.id)
             ? current
             : { ...current, events: [...current.events, payload] }
         );
-        loadProjectData(selectedProjectId, selectedRunId).catch(() => undefined);
-        if (["run.completed", "run.failed", "run.cancelled"].includes(payload.type)) {
+
+        // Targeted refresh: every event refreshes the run detail (single
+        // API call carrying artifacts + node_executions + events). We do
+        // NOT reload the whole project on every event anymore.
+        loadRunDetail(selectedRunId).catch(() => undefined);
+
+        // On terminal events, also refresh the runs list (sidebar status)
+        // and project files (so the Files tab + explorer drawer pick up
+        // newly-written run artifacts), and re-fetch this run's chat
+        // (so the assistant/system completion message appears).
+        if (TERMINAL_EVENTS.has(payload.type)) {
+          refreshRunsList(selectedProjectId).catch(() => undefined);
+          refreshProjectFiles(selectedProjectId).catch(() => undefined);
+          apiFetch<ChatMessage[]>(
+            `/projects/${selectedProjectId}/messages?run_id=${encodeURIComponent(selectedRunId)}`
+          )
+            .then(setMessages)
+            .catch(() => undefined);
+        }
+
+        // Don't close the stream on `run.paused` — a Continue might
+        // re-emit events on the same run.
+        if (payload.type === "run.completed" || payload.type === "run.failed" || payload.type === "run.cancelled") {
           source.close();
           if (eventSourceRef.current === source) eventSourceRef.current = null;
         }
@@ -386,7 +493,7 @@ export default function WorkspacePage() {
       source.close();
       if (eventSourceRef.current === source) eventSourceRef.current = null;
     };
-  }, [loadProjectData, selectedProjectId, selectedRunId]);
+  }, [loadRunDetail, refreshProjectFiles, refreshRunsList, selectedProjectId, selectedRunId]);
 
   // Auto-load preview when output viewer or artifacts change.
   useEffect(() => {
@@ -1048,12 +1155,15 @@ export default function WorkspacePage() {
                     const isPausedHere =
                       selectedRun.status === "paused" && isStopPoint;
                     const isSelected = tplNode.id === selectedNodeId;
+                    // Match by node_id within this run — paths are now run-scoped
+                    // (runs/<run_id>/<configured-path>) so direct path equality with
+                    // the template's logical path no longer works.
                     const artifact =
                       selectedRun.artifacts?.find(
                         (a) =>
                           a.deleted_at === null &&
-                          a.node_id === tplNode.id &&
-                          a.path === tplNode.output.path
+                          a.run_id === selectedRun.id &&
+                          a.node_id === tplNode.id
                       ) ?? null;
                     const nextNode = templateNodes[index + 1];
                     const modelDisplay =

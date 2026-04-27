@@ -47,3 +47,10 @@ async def init_db() -> None:
         await connection.execute(
             sql_text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS stop_after_node_id VARCHAR(64)")
         )
+        # order_index lets the API return node executions in template order
+        # rather than alphabetic node_id order.
+        await connection.execute(
+            sql_text(
+                "ALTER TABLE node_executions ADD COLUMN IF NOT EXISTS order_index INTEGER NOT NULL DEFAULT 0"
+            )
+        )

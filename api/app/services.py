@@ -193,7 +193,20 @@ class StorageService:
             raise HTTPException(status_code=400, detail="Path escapes project root.")
         if normalized.startswith("projects/"):
             raise HTTPException(status_code=400, detail="Path must be project-relative.")
-        if path.parts[0] not in ALLOWED_PROJECT_PREFIXES:
+        # Two valid shapes:
+        #   <section>/<file>             — project-wide files (uploads in input/, etc.)
+        #   runs/<run_id>/<section>/...  — run-scoped artifacts; immutable per run
+        if path.parts[0] == "runs":
+            if len(path.parts) < 3:
+                raise HTTPException(
+                    status_code=400, detail="runs/<run_id>/<section>/... requires an inner section."
+                )
+            if path.parts[2] not in ALLOWED_PROJECT_PREFIXES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Inner section must be one of {sorted(ALLOWED_PROJECT_PREFIXES)}.",
+                )
+        elif path.parts[0] not in ALLOWED_PROJECT_PREFIXES:
             raise HTTPException(status_code=400, detail="Path must start with an allowed project folder.")
         return normalized
 
@@ -256,71 +269,24 @@ class StorageService:
         return response["Body"].read()
 
     async def list_files(self, db: AsyncSession, project_id: str, prefix: str = "") -> list[Artifact]:
+        """Return only DB-backed (and not soft-deleted) artifacts. We deliberately do NOT
+        fabricate Artifact rows from raw R2 listings: every row returned here must have a
+        real id so the frontend's preview/download/delete actions can resolve to a row.
+        """
         project = await db.get(Project, project_id)
         if not project:
             return []
 
-        safe_prefix = self.validate_relative_path(prefix) if prefix else ""
-        root_prefix = f"{project.r2_root_prefix.rstrip('/')}/"
-        list_prefix = root_prefix
-        if safe_prefix:
-            list_prefix = f"{root_prefix}{safe_prefix.rstrip('/')}"
-            if not list_prefix.endswith("/"):
-                list_prefix = f"{list_prefix}/"
-
-        objects: list[dict[str, Any]] = []
-        continuation_token: str | None = None
-        while True:
-            params: dict[str, Any] = {
-                "Bucket": settings.cloudflare_r2_bucket,
-                "Prefix": list_prefix,
-                "MaxKeys": 1000,
-            }
-            if continuation_token:
-                params["ContinuationToken"] = continuation_token
-            response = await self._run_s3("list_objects_v2", **params)
-            objects.extend(response.get("Contents", []))
-            if not response.get("IsTruncated"):
-                break
-            continuation_token = response.get("NextContinuationToken")
-
-        artifact_result = await db.execute(
-            select(Artifact).where(Artifact.project_id == project_id).order_by(desc(Artifact.created_at))
+        statement = select(Artifact).where(
+            Artifact.project_id == project_id,
+            Artifact.deleted_at.is_(None),
         )
-        latest_by_path: dict[str, Artifact] = {}
-        for artifact in artifact_result.scalars().all():
-            if artifact.path not in latest_by_path:
-                latest_by_path[artifact.path] = artifact
-
-        files: list[Artifact] = []
-        for item in objects:
-            key = item.get("Key", "")
-            if not key or key.endswith("/"):
-                continue
-            relative_path = key[len(root_prefix):] if key.startswith(root_prefix) else key
-            artifact = latest_by_path.get(relative_path)
-            if artifact:
-                artifact.size_bytes = int(item.get("Size", artifact.size_bytes))
-                files.append(artifact)
-                continue
-
-            files.append(
-                Artifact(
-                    id=generate_id("art"),
-                    project_id=project_id,
-                    run_id=None,
-                    node_id=None,
-                    path=relative_path,
-                    filename=PurePosixPath(relative_path).name,
-                    mime_type="application/octet-stream",
-                    size_bytes=int(item.get("Size", 0)),
-                    created_by="system",
-                    created_at=utcnow(),
-                )
-            )
-
-        files.sort(key=lambda artifact: artifact.created_at, reverse=True)
-        return files
+        if prefix:
+            safe_prefix = self.validate_relative_path(prefix).rstrip("/")
+            statement = statement.where(Artifact.path.startswith(f"{safe_prefix}/"))
+        statement = statement.order_by(desc(Artifact.created_at))
+        result = await db.execute(statement)
+        return list(result.scalars().all())
 
     async def delete_project_tree(self, project: Project) -> int:
         """List + batch-delete every R2 object under the project's root prefix.
@@ -799,11 +765,12 @@ class WorkflowService:
                 content=message,
             )
         )
-        for node in nodes_config:
+        for index, node in enumerate(nodes_config):
             db.add(
                 NodeExecution(
                     id=generate_id("nex"),
                     run_id=run.id,
+                    order_index=index,
                     node_id=node["id"],
                     node_name=node["name"],
                     node_type=node["type"],
@@ -1029,10 +996,14 @@ class WorkflowService:
                 payload_text = content
                 mime_type = "text/markdown"
 
+            # Write to a run-scoped path so old runs remain inspectable. The
+            # template config holds the *logical* path (e.g. "working/intent.json");
+            # the actual R2 key becomes "runs/<run_id>/<logical_path>".
+            run_scoped_path = f"runs/{run.id}/{node_config['output']['path']}"
             artifact = await self.storage.write_file(
                 db,
                 project,
-                node_config["output"]["path"],
+                run_scoped_path,
                 payload_text,
                 mime_type,
                 "node",
@@ -1128,10 +1099,11 @@ class WorkflowService:
                 )
             html = self.pdf_service.markdown_to_html(markdown_text)
             pdf_bytes = await self.pdf_service.html_to_pdf(html)
+            run_scoped_path = f"runs/{run.id}/{node_config['output']['path']}"
             artifact = await self.storage.write_file(
                 db,
                 project,
-                node_config["output"]["path"],
+                run_scoped_path,
                 pdf_bytes,
                 "application/pdf",
                 "node",
