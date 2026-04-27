@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -165,7 +165,7 @@ app.add_middleware(
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health() -> dict[str, Any]:
     return {"ok": True, "service": "api"}
 
 
@@ -236,7 +236,7 @@ async def list_openrouter_models(current_user: User = Depends(get_current_user))
 
 
 @app.get("/health/db")
-async def health_db(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+async def health_db(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     try:
         await db.execute(text("SELECT 1"))
     except Exception as exc:
@@ -245,7 +245,7 @@ async def health_db(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
 
 
 @app.get("/health/redis")
-async def health_redis() -> dict[str, str]:
+async def health_redis() -> dict[str, Any]:
     redis = redis_from_url(settings.redis_url, decode_responses=True)
     try:
         try:
@@ -258,7 +258,7 @@ async def health_redis() -> dict[str, str]:
 
 
 @app.get("/health/r2")
-async def health_r2() -> dict[str, str]:
+async def health_r2() -> dict[str, Any]:
     try:
         await storage_service.check_bucket_access()
     except Exception as exc:
