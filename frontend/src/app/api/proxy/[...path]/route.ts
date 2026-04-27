@@ -15,33 +15,56 @@ function buildUpstreamUrl(path: string[], request: NextRequest): string {
   return upstream.toString();
 }
 
+function copySafeResponseHeaders(source: Headers): Headers {
+  const headers = new Headers();
+  const contentType = source.get("content-type");
+  const cacheControl = source.get("cache-control");
+  const location = source.get("location");
+
+  if (contentType) {
+    headers.set("content-type", contentType);
+  }
+  if (cacheControl) {
+    headers.set("cache-control", cacheControl);
+  }
+  if (location) {
+    headers.set("location", location);
+  }
+
+  headers.set("x-flowpro-proxy", "1");
+  return headers;
+}
+
 async function proxy(request: NextRequest, context: { params: { path: string[] } }): Promise<Response> {
-  const { path } = context.params;
-  const url = buildUpstreamUrl(path, request);
-  const headers = new Headers(request.headers);
-  headers.delete("host");
-  headers.delete("content-length");
+  try {
+    const { path } = context.params;
+    const url = buildUpstreamUrl(path, request);
+    const headers = new Headers(request.headers);
+    headers.delete("host");
+    headers.delete("content-length");
 
-  const body =
-    request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
+    const body =
+      request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
 
-  const upstream = await fetch(url, {
-    method: request.method,
-    headers,
-    body,
-    cache: "no-store",
-    redirect: "manual",
-  });
+    const upstream = await fetch(url, {
+      method: request.method,
+      headers,
+      body,
+      cache: "no-store",
+      redirect: "manual",
+    });
 
-  const responseHeaders = new Headers(upstream.headers);
-  responseHeaders.delete("content-length");
-  responseHeaders.set("x-flowpro-proxy", "1");
+    const payload = request.method === "HEAD" ? null : await upstream.arrayBuffer();
 
-  return new Response(upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers: responseHeaders,
-  });
+    return new Response(payload, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: copySafeResponseHeaders(upstream.headers),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Frontend API proxy failed.";
+    return Response.json({ detail: message }, { status: 502 });
+  }
 }
 
 export const GET = proxy;
