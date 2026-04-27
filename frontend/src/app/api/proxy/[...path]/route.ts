@@ -51,6 +51,19 @@ async function proxy(request: NextRequest, context: { params: { path: string[] }
       redirect: "manual",
     });
 
+    const contentType = upstream.headers.get("content-type") ?? "";
+    if (contentType.includes("text/event-stream")) {
+      const responseHeaders = copySafeResponseHeaders(upstream.headers);
+      responseHeaders.set("content-type", "text/event-stream");
+      responseHeaders.set("cache-control", "no-cache, no-transform");
+      responseHeaders.set("connection", "keep-alive");
+      return new Response(upstream.body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: responseHeaders,
+      });
+    }
+
     const payload = request.method === "HEAD" ? null : await upstream.arrayBuffer();
 
     return new Response(payload, {

@@ -196,13 +196,71 @@ class StorageService:
         return response["Body"].read()
 
     async def list_files(self, db: AsyncSession, project_id: str, prefix: str = "") -> list[Artifact]:
-        statement = select(Artifact).where(Artifact.project_id == project_id, Artifact.deleted_at.is_(None))
-        if prefix:
-            safe_prefix = self.validate_relative_path(prefix)
-            statement = statement.where(Artifact.path.startswith(safe_prefix))
-        statement = statement.order_by(desc(Artifact.created_at))
-        result = await db.execute(statement)
-        return list(result.scalars().all())
+        project = await db.get(Project, project_id)
+        if not project:
+            return []
+
+        safe_prefix = self.validate_relative_path(prefix) if prefix else ""
+        root_prefix = f"{project.r2_root_prefix.rstrip('/')}/"
+        list_prefix = root_prefix
+        if safe_prefix:
+            list_prefix = f"{root_prefix}{safe_prefix.rstrip('/')}"
+            if not list_prefix.endswith("/"):
+                list_prefix = f"{list_prefix}/"
+
+        objects: list[dict[str, Any]] = []
+        continuation_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "Bucket": settings.cloudflare_r2_bucket,
+                "Prefix": list_prefix,
+                "MaxKeys": 1000,
+            }
+            if continuation_token:
+                params["ContinuationToken"] = continuation_token
+            response = await self._run_s3("list_objects_v2", **params)
+            objects.extend(response.get("Contents", []))
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+
+        artifact_result = await db.execute(
+            select(Artifact).where(Artifact.project_id == project_id).order_by(desc(Artifact.created_at))
+        )
+        latest_by_path: dict[str, Artifact] = {}
+        for artifact in artifact_result.scalars().all():
+            if artifact.path not in latest_by_path:
+                latest_by_path[artifact.path] = artifact
+
+        files: list[Artifact] = []
+        for item in objects:
+            key = item.get("Key", "")
+            if not key or key.endswith("/"):
+                continue
+            relative_path = key[len(root_prefix):] if key.startswith(root_prefix) else key
+            artifact = latest_by_path.get(relative_path)
+            if artifact:
+                artifact.size_bytes = int(item.get("Size", artifact.size_bytes))
+                files.append(artifact)
+                continue
+
+            files.append(
+                Artifact(
+                    id=generate_id("art"),
+                    project_id=project_id,
+                    run_id=None,
+                    node_id=None,
+                    path=relative_path,
+                    filename=PurePosixPath(relative_path).name,
+                    mime_type="application/octet-stream",
+                    size_bytes=int(item.get("Size", 0)),
+                    created_by="system",
+                    created_at=utcnow(),
+                )
+            )
+
+        files.sort(key=lambda artifact: artifact.created_at, reverse=True)
+        return files
 
     async def delete_file(self, db: AsyncSession, project: Project, relative_path: str) -> Artifact:
         safe_path = self.validate_relative_path(relative_path)
@@ -210,11 +268,11 @@ class StorageService:
             select(Artifact).where(
                 Artifact.project_id == project.id,
                 Artifact.path == safe_path,
-                Artifact.deleted_at.is_(None),
-            )
+            ).order_by(desc(Artifact.created_at))
         )
-        artifact = result.scalar_one_or_none()
-        if not artifact:
+        artifacts = list(result.scalars().all())
+        artifact = artifacts[0] if artifacts else None
+        if artifact is None:
             raise HTTPException(status_code=404, detail="Artifact not found.")
 
         await self._run_s3(
@@ -222,7 +280,9 @@ class StorageService:
             Bucket=settings.cloudflare_r2_bucket,
             Key=self.build_object_key(project, safe_path),
         )
-        artifact.deleted_at = utcnow()
+        deleted_at = utcnow()
+        for candidate in artifacts:
+            candidate.deleted_at = deleted_at
         logger.info("Deleted project file %s for project %s", safe_path, project.id)
         await db.flush()
         return artifact

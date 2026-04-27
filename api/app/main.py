@@ -7,7 +7,7 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, EmailStr
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy import desc, select, text
@@ -112,7 +112,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"ok": True, "service": "api"}
 
 
 @app.get("/health/db")
@@ -121,7 +121,7 @@ async def health_db(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
         await db.execute(text("SELECT 1"))
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}") from exc
-    return {"status": "ok"}
+    return {"ok": True, "database": "connected"}
 
 
 @app.get("/health/redis")
@@ -134,7 +134,7 @@ async def health_redis() -> dict[str, str]:
             raise HTTPException(status_code=503, detail=f"Redis unavailable: {exc}") from exc
     finally:
         await redis.close()
-    return {"status": "ok"}
+    return {"ok": True, "redis": "connected"}
 
 
 @app.get("/health/r2")
@@ -143,7 +143,7 @@ async def health_r2() -> dict[str, str]:
         await storage_service.check_bucket_access()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"R2 unavailable: {exc}") from exc
-    return {"status": "ok"}
+    return {"ok": True, "r2": "connected", "bucket": settings.cloudflare_r2_bucket}
 
 
 @app.post("/auth/register")
@@ -358,24 +358,43 @@ async def stream_run_events(
     await get_project_for_user(db, run.project_id, current_user.id)
 
     async def stream() -> AsyncIterator[str]:
-        last_event_created_at = None
+        seen_event_ids: set[str] = set()
+        keepalive_counter = 0
+        yield "retry: 3000\n\n"
         while True:
             async with AsyncSessionLocal() as session:
                 live_run = await session.get(Run, run_id)
-                statement = select(RunEvent).where(RunEvent.run_id == run_id)
-                if last_event_created_at is not None:
-                    statement = statement.where(RunEvent.created_at > last_event_created_at)
-                statement = statement.order_by(RunEvent.created_at)
+                statement = select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.created_at)
                 result = await session.execute(statement)
                 events = result.scalars().all()
+                emitted = False
                 for event in events:
-                    last_event_created_at = event.created_at
-                    yield f"data: {json.dumps(serialize_run_event(event))}\n\n"
+                    if event.id in seen_event_ids:
+                        continue
+                    seen_event_ids.add(event.id)
+                    emitted = True
+                    payload = json.dumps(serialize_run_event(event))
+                    yield f"id: {event.id}\nevent: {event.event_type}\ndata: {payload}\n\n"
+                if not emitted:
+                    keepalive_counter += 1
+                    if keepalive_counter >= 5:
+                        keepalive_counter = 0
+                        yield ": keepalive\n\n"
+                else:
+                    keepalive_counter = 0
                 if live_run and live_run.status in {"completed", "failed", "cancelled"}:
                     break
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
-    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/projects/{project_id}/files")
@@ -477,6 +496,24 @@ async def get_artifact_download_url(
         raise HTTPException(status_code=404, detail="Artifact not found.")
     project = await get_project_for_user(db, artifact.project_id, current_user.id)
     return {"download_url": await storage_service.get_signed_download_url(project, artifact.path)}
+
+
+@app.get("/artifacts/{artifact_id}/content")
+async def get_artifact_content(
+    artifact_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    artifact = await db.get(Artifact, artifact_id)
+    if not artifact or artifact.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+    project = await get_project_for_user(db, artifact.project_id, current_user.id)
+    content = await storage_service.read_file(project, artifact.path)
+    return Response(
+        content=content,
+        media_type=artifact.mime_type,
+        headers={"Content-Disposition": f'inline; filename="{artifact.filename}"'},
+    )
 
 
 @app.delete("/artifacts/{artifact_id}")

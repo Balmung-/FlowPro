@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \
     fonts-liberation \
+    libcairo2 \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -20,6 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 \
     libnspr4 \
     libnss3 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
     libx11-xcb1 \
     libxcomposite1 \
     libxdamage1 \
