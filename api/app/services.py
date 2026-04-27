@@ -960,42 +960,22 @@ class WorkflowService:
 
         def proposal_markdown(title: str, summary_line: str) -> str:
             return (
-                f"# {title}
-
-"
-                "## Executive summary
-"
-                f"{summary_line}
-
-"
-                "## Recommended actions
-"
-                "1. Keep the Phase 1 workflow fixed so the team can validate infrastructure before expanding scope.
-"
-                "2. Make the workspace chat-first so the user can move from request to run without leaving the main screen.
-"
-                "3. Preserve run-level artifacts so every completed run remains inspectable and auditable.
-"
-                "4. Keep MOCK_AI enabled during deployment testing so Railway, R2, Redis, Postgres, SSE, and PDF generation can be verified independently of model quality.
-
-"
-                "## Risks
-"
-                "- If runs overwrite shared outputs without immutable storage, historical inspection becomes misleading.
-"
-                "- If live updates refetch the whole workspace on every event, the UI becomes noisy and unreliable.
-"
-                "- If the primary composer is unclear, users will treat the product like a debugger instead of a document cockpit.
-
-"
-                "## Next steps
-"
-                "1. Run the fixed workflow with MOCK_AI=true in Railway.
-"
-                "2. Confirm Markdown and PDF outputs render correctly from the selected run.
-"
-                "3. Review the run logs and node outputs, then enable OpenRouter only after the infrastructure path is stable.
-"
+                f"# {title}\n\n"
+                "## Executive summary\n"
+                f"{summary_line}\n\n"
+                "## Recommended actions\n"
+                "1. Keep the Phase 1 workflow fixed so the team can validate infrastructure before expanding scope.\n"
+                "2. Make the workspace chat-first so the user can move from request to run without leaving the main screen.\n"
+                "3. Preserve run-level artifacts so every completed run remains inspectable and auditable.\n"
+                "4. Keep MOCK_AI enabled during deployment testing so Railway, R2, Redis, Postgres, SSE, and PDF generation can be verified independently of model quality.\n\n"
+                "## Risks\n"
+                "- If runs overwrite shared outputs without immutable storage, historical inspection becomes misleading.\n"
+                "- If live updates refetch the whole workspace on every event, the UI becomes noisy and unreliable.\n"
+                "- If the primary composer is unclear, users will treat the product like a debugger instead of a document cockpit.\n\n"
+                "## Next steps\n"
+                "1. Run the fixed workflow with MOCK_AI=true in Railway.\n"
+                "2. Confirm Markdown and PDF outputs render correctly from the selected run.\n"
+                "3. Review the run logs and node outputs, then enable OpenRouter only after the infrastructure path is stable.\n"
             )
 
         if mock is not None:
@@ -1051,55 +1031,29 @@ class WorkflowService:
             }
         elif "outline" in node_key:
             content = (
-                "# Proposal outline
-
-"
-                "## Executive summary
-"
-                "## Why this matters now
-"
-                "## Recommended actions
-"
-                "## Risks
-"
-                "## Next steps
-"
+                "# Proposal outline\n\n"
+                "## Executive summary\n"
+                "## Why this matters now\n"
+                "## Recommended actions\n"
+                "## Risks\n"
+                "## Next steps\n"
             )
         elif "draft" in node_key and "final" not in node_key:
             content = (
-                "# Draft proposal for an AI document cockpit
-
-"
-                "## Executive summary
-"
-                f"This draft responds to the request to {request_line.lower()}. It proposes a narrow Phase 1 release focused on a reliable chat-to-document workflow that runs on Railway and keeps every execution inspectable.
-
-"
-                "## Why this matters now
-"
-                "The team needs to prove the infrastructure path before adding more product surface area. A fixed workflow with visible node execution, reliable storage, and stable output rendering is the fastest way to validate the core value.
-
-"
-                "## Recommended actions
-"
-                "1. Keep the workflow fixed at seven nodes.
-"
-                "2. Use a chat-first workspace so the request and run initiation happen in one place.
-"
-                "3. Keep live updates focused on the selected run.
-"
-                "4. Preserve per-run artifacts for historical inspection.
-
-"
-                "## Risks
-"
-                "The biggest risk is letting the UI look complete while the selected run cannot be trusted. Another risk is coupling deployment validation to model quality instead of infrastructure correctness.
-
-"
-                "## Next steps
-"
-                "Run the workflow in MOCK_AI mode, inspect the generated files, and only then switch the environment toward live model execution.
-"
+                "# Draft proposal for an AI document cockpit\n\n"
+                "## Executive summary\n"
+                f"This draft responds to the request to {request_line.lower()}. It proposes a narrow Phase 1 release focused on a reliable chat-to-document workflow that runs on Railway and keeps every execution inspectable.\n\n"
+                "## Why this matters now\n"
+                "The team needs to prove the infrastructure path before adding more product surface area. A fixed workflow with visible node execution, reliable storage, and stable output rendering is the fastest way to validate the core value.\n\n"
+                "## Recommended actions\n"
+                "1. Keep the workflow fixed at seven nodes.\n"
+                "2. Use a chat-first workspace so the request and run initiation happen in one place.\n"
+                "3. Keep live updates focused on the selected run.\n"
+                "4. Preserve per-run artifacts for historical inspection.\n\n"
+                "## Risks\n"
+                "The biggest risk is letting the UI look complete while the selected run cannot be trusted. Another risk is coupling deployment validation to model quality instead of infrastructure correctness.\n\n"
+                "## Next steps\n"
+                "Run the workflow in MOCK_AI mode, inspect the generated files, and only then switch the environment toward live model execution.\n"
             )
         elif "final" in node_key or node_config.get("output", {}).get("path") == "final/output.md":
             content = proposal_markdown(
@@ -1108,14 +1062,9 @@ class WorkflowService:
             )
         else:
             content = (
-                f"# {node_config['name']}
-
-"
-                "Deterministic mock output generated because MOCK_AI=true.
-
-"
-                f"Request: {request_line}
-"
+                f"# {node_config['name']}\n\n"
+                "Deterministic mock output generated because MOCK_AI=true.\n\n"
+                f"Request: {request_line}\n"
             )
 
         rendered = content if isinstance(content, str) else json.dumps(content, indent=2)
