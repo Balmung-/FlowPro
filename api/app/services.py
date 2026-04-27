@@ -93,7 +93,7 @@ WORKFLOW_NODES = [
 
 class AuthService:
     def __init__(self) -> None:
-        self.password_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        self.password_context = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")
 
     def hash_password(self, password: str) -> str:
         return self.password_context.hash(password)
