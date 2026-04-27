@@ -377,9 +377,17 @@ export default function TemplateBuilderPage() {
     <main className="flex h-screen flex-col bg-slate-50 text-slate-900">
       <header className="flex items-center justify-between gap-4 border-b border-slate-200 bg-white px-6 py-4">
         <div className="min-w-0">
-          <Link className="text-xs font-medium text-slate-500 hover:underline" href="/templates">
-            ← Templates
-          </Link>
+          <div className="flex items-center gap-3 text-xs">
+            <Link className="font-medium text-slate-500 hover:underline" href="/workspace">
+              ← Workspace (chat)
+            </Link>
+            <span className="text-slate-300">/</span>
+            <Link className="font-medium text-slate-500 hover:underline" href="/templates">
+              Templates
+            </Link>
+            <span className="text-slate-300">/</span>
+            <span className="font-medium text-slate-700">Builder</span>
+          </div>
           <div className="mt-1 flex items-center gap-3">
             <input
               className={clsx(
@@ -411,8 +419,20 @@ export default function TemplateBuilderPage() {
             readOnly={readOnly}
             onChange={(event) => updateConfig({ description: event.target.value })}
           />
+          <p className="mt-2 max-w-3xl rounded-md bg-slate-50 px-3 py-1.5 text-[11px] leading-snug text-slate-600">
+            <span className="font-semibold">This is the backend.</span> When a user chats in a
+            project that uses this template and hits Run, these nodes execute in order. Want to test
+            it? Click <span className="font-semibold">Open chat →</span> on the right.
+          </p>
         </div>
         <div className="flex items-center gap-2">
+          <Link
+            className="inline-flex items-center gap-1 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700"
+            href="/workspace"
+            title="Go to the chat workspace where this template runs"
+          >
+            <span aria-hidden>💬</span> Open chat
+          </Link>
           {info ? <span className="text-xs text-emerald-700">{info}</span> : null}
           {readOnly && template ? (
             <button

@@ -61,22 +61,36 @@ export default function TemplatesPage() {
     <main className="min-h-screen bg-slate-50 text-slate-900">
       <div className="mx-auto max-w-5xl px-6 py-10">
         <div className="flex items-center justify-between gap-4">
-          <div>
-            <Link className="text-xs font-medium text-slate-500 hover:underline" href="/workspace">
-              ← Back to workspace
-            </Link>
+          <div className="min-w-0">
+            <div className="flex items-center gap-3 text-xs">
+              <Link className="font-medium text-slate-500 hover:underline" href="/workspace">
+                ← Workspace (chat)
+              </Link>
+              <span className="text-slate-300">/</span>
+              <span className="font-medium text-slate-700">Templates</span>
+            </div>
             <h1 className="mt-2 text-2xl font-semibold text-slate-950">Templates</h1>
-            <p className="mt-1 text-sm text-slate-500">
-              A template is a node graph: each node calls an OpenRouter model and writes a file the
-              next node can read.
+            <p className="mt-1 max-w-2xl text-sm text-slate-500">
+              A template is the workflow that runs when a user chats in a project. Each node calls
+              an OpenRouter model and writes a file the next node can read. To <strong>use</strong>{" "}
+              a template, go to the <Link className="text-blue-600 hover:underline" href="/workspace">workspace</Link>,
+              create a project that picks this template, and chat.
             </p>
           </div>
-          <Link
-            className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white shadow-sm"
-            href="/templates/new"
-          >
-            New template
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link
+              className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 shadow-sm hover:bg-slate-50"
+              href="/workspace"
+            >
+              💬 Open chat
+            </Link>
+            <Link
+              className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white shadow-sm"
+              href="/templates/new"
+            >
+              + New template
+            </Link>
+          </div>
         </div>
 
         {error ? (
