@@ -134,6 +134,7 @@ class VaultUpdateRequest(BaseModel):
 class MessageCreateRequest(BaseModel):
     role: Literal["user", "assistant", "system"] = "user"
     content: str
+    run_id: str | None = None
 
 
 class RunCreateRequest(BaseModel):
@@ -674,9 +675,15 @@ async def create_message(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     await get_project_for_user(db, project_id, current_user.id)
+    run_id = payload.run_id
+    if run_id:
+        run = await db.get(Run, run_id)
+        if not run or run.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Run not found.")
     message = ChatMessage(
         id=generate_id("msg"),
         project_id=project_id,
+        run_id=run_id,
         role=payload.role,
         content=payload.content,
     )
@@ -954,7 +961,7 @@ async def get_artifact_download_url(
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found.")
     project = await get_project_for_user(db, artifact.project_id, current_user.id)
-    return {"download_url": await storage_service.get_signed_download_url(project, artifact.path)}
+    return {"download_url": await storage_service.get_artifact_download_url(project, artifact)}
 
 
 @app.get("/artifacts/{artifact_id}/content")
@@ -967,7 +974,7 @@ async def get_artifact_content(
     if not artifact or artifact.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Artifact not found.")
     project = await get_project_for_user(db, artifact.project_id, current_user.id)
-    content = await storage_service.read_file(project, artifact.path)
+    content = await storage_service.read_artifact(project, artifact)
     return Response(
         content=content,
         media_type=artifact.mime_type,
@@ -985,7 +992,7 @@ async def delete_artifact(
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found.")
     project = await get_project_for_user(db, artifact.project_id, current_user.id)
-    deleted = await storage_service.delete_file(db, project, artifact.path)
+    deleted = await storage_service.delete_artifact(db, project, artifact)
     await db.commit()
     return {"deleted": True, "artifact": serialize_artifact(deleted)}
 

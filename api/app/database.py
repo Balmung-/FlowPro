@@ -54,3 +54,19 @@ async def init_db() -> None:
                 "ALTER TABLE node_executions ADD COLUMN IF NOT EXISTS order_index INTEGER NOT NULL DEFAULT 0"
             )
         )
+        await connection.execute(
+            sql_text(
+                "ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS storage_path VARCHAR(1024)"
+            )
+        )
+        await connection.execute(
+            sql_text(
+                "UPDATE artifacts SET storage_path = path WHERE storage_path IS NULL"
+            )
+        )
+        await connection.execute(
+            sql_text(
+                "UPDATE artifacts SET path = regexp_replace(path, '^runs/[^/]+/', '') "
+                "WHERE path LIKE 'runs/%/%'"
+            )
+        )

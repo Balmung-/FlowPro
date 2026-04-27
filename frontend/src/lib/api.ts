@@ -136,6 +136,7 @@ export type Artifact = {
   run_id: string | null;
   node_id: string | null;
   path: string;
+  storage_path?: string;
   filename: string;
   mime_type: string;
   size_bytes: number;

@@ -4,7 +4,6 @@ import "react18-json-view/src/style.css";
 
 import clsx from "clsx";
 import JsonView from "react18-json-view";
-import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
@@ -25,7 +24,6 @@ import {
   apiFetch,
 } from "@/lib/api";
 import { clearAuthSession, getStoredToken } from "@/lib/auth";
-import FileExplorerDrawer from "@/components/file-explorer-drawer";
 import DeleteProjectModal from "@/components/delete-project-modal";
 
 const STREAM_EVENT_TYPES = [
@@ -64,7 +62,7 @@ function formatBytes(size: number): string {
 }
 
 function formatDateTime(value: string | null | undefined): string {
-  if (!value) return "—";
+  if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
@@ -91,6 +89,21 @@ function filePreviewPath(artifactId: string): string {
   return `${API_BASE}/artifacts/${artifactId}/content`;
 }
 
+function toRunSummary(run: Run | RunDetail): Run {
+  return {
+    id: run.id,
+    project_id: run.project_id,
+    status: run.status,
+    input_message: run.input_message,
+    state_json: run.state_json,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+    completed_at: run.completed_at,
+    error_message: run.error_message,
+    stop_after_node_id: run.stop_after_node_id,
+  };
+}
+
 export default function WorkspacePage() {
   const router = useRouter();
   const uploadRef = useRef<HTMLInputElement | null>(null);
@@ -112,7 +125,6 @@ export default function WorkspacePage() {
   const [showCreateProject, setShowCreateProject] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [projectDescription, setProjectDescription] = useState("");
-  const [projectTemplateId, setProjectTemplateId] = useState("");
   const [previewArtifactId, setPreviewArtifactId] = useState("");
   const [previewText, setPreviewText] = useState("");
   const [previewUrl, setPreviewUrl] = useState("");
@@ -123,8 +135,6 @@ export default function WorkspacePage() {
   const [isUploadingFiles, setIsUploadingFiles] = useState(false);
   const [isStartingRun, setIsStartingRun] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [explorerOpen, setExplorerOpen] = useState(false);
-  const [explorerInitialTab, setExplorerInitialTab] = useState<"project" | "vault">("project");
   const [me, setMe] = useState<User | null>(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
 
@@ -138,10 +148,45 @@ export default function WorkspacePage() {
     return templates.find((tpl) => tpl.id === selectedProject.template_id) ?? null;
   }, [selectedProject, templates]);
 
-  const templateNodes: TemplateNodeConfig[] = useMemo(
-    () => activeTemplate?.config_json?.nodes ?? [],
-    [activeTemplate]
-  );
+  const templateNodes: TemplateNodeConfig[] = useMemo(() => {
+    const baseNodes = activeTemplate?.config_json?.nodes ?? [];
+    if (!selectedRun?.node_executions?.length) {
+      return baseNodes;
+    }
+    const baseById = new Map(baseNodes.map((node) => [node.id, node]));
+    return selectedRun.node_executions.map((execution) => {
+      const base = baseById.get(execution.node_id);
+      const artifact =
+        (selectedRun.artifacts ?? []).find(
+          (item) => item.deleted_at === null && item.run_id === selectedRun.id && item.node_id === execution.node_id
+        ) ?? null;
+      const inferredFormat = artifact?.mime_type.includes("pdf")
+        ? "pdf"
+        : artifact?.mime_type.includes("json")
+          ? "json"
+          : "markdown";
+      return {
+        id: execution.node_id,
+        name: execution.node_name,
+        type: (base?.type ?? execution.node_type) as TemplateNodeConfig["type"],
+        model: base?.model ?? execution.model_used ?? undefined,
+        model_profile: base?.model_profile ?? execution.model_profile ?? undefined,
+        system_prompt: base?.system_prompt ?? "",
+        instruction: base?.instruction,
+        include_message: base?.include_message,
+        include_uploaded_files: base?.include_uploaded_files,
+        user_prompt_template: base?.user_prompt_template ?? "",
+        reads: base?.reads ?? [],
+        output: base?.output ?? {
+          format: inferredFormat,
+          path: artifact?.path ?? "",
+          state_section: inferredFormat === "pdf" ? "final" : "working",
+          state_key: execution.node_id,
+        },
+        mock_content: base?.mock_content,
+      };
+    });
+  }, [activeTemplate, selectedRun]);
 
   const allowedViewers: ViewerKind[] = useMemo(() => {
     const list = activeTemplate?.config_json?.allowed_viewers ?? ["markdown", "pdf", "json"];
@@ -167,63 +212,45 @@ export default function WorkspacePage() {
     [runs]
   );
 
-  // Extract the *logical* section from an artifact path. Run-scoped artifacts
-  // live at "runs/<run_id>/<section>/...", project-wide ones (uploads) at
-  // "<section>/...". This collapses both shapes to the section name.
-  const logicalSection = useCallback((path: string): string | null => {
-    if (path.startsWith("runs/")) {
-      const parts = path.split("/");
-      return parts[2] ?? null;
-    }
-    return path.split("/")[0] ?? null;
-  }, []);
+  const activeRunArtifacts = useMemo(
+    () => (selectedRun?.artifacts ?? []).filter((artifact) => artifact.deleted_at === null),
+    [selectedRun]
+  );
+  const visibleMessages = useMemo(
+    () => (selectedRunId ? messages.filter((message) => message.run_id === selectedRunId) : []),
+    [messages, selectedRunId]
+  );
 
-  const filesByGroup = useMemo(() => {
+  const projectInputFiles = useMemo(
+    () =>
+      files.filter(
+        (artifact) => artifact.deleted_at === null && artifact.path.startsWith("input/")
+      ),
+    [files]
+  );
+  const runFilesByGroup = useMemo(() => {
     const grouped = {
-      input: [] as Artifact[],
       working: [] as Artifact[],
       final: [] as Artifact[],
       logs: [] as Artifact[],
       archive: [] as Artifact[],
     };
-    for (const artifact of files) {
-      // Files tab in the inspector is run-scoped — only show the selected
-      // run's artifacts (plus project uploads in input/, which aren't tied
-      // to any run).
-      const isProjectUpload = artifact.run_id === null;
-      const isThisRun = selectedRunId && artifact.run_id === selectedRunId;
-      if (!isProjectUpload && !isThisRun) continue;
-      const section = logicalSection(artifact.path);
-      if (section && section in grouped) {
-        grouped[section as keyof typeof grouped].push(artifact);
+    for (const artifact of activeRunArtifacts) {
+      const section = artifact.path.split("/")[0] as keyof typeof grouped;
+      if (section in grouped) {
+        grouped[section].push(artifact);
       }
     }
     return grouped;
-  }, [files, selectedRunId, logicalSection]);
+  }, [activeRunArtifacts]);
 
-  const activeRunArtifacts = useMemo(
-    () => (selectedRun?.artifacts ?? []).filter((artifact) => artifact.deleted_at === null),
-    [selectedRun]
-  );
-  // Resolve the run's final outputs by filename suffix. Path is
-  // runs/<run_id>/final/output.md (new) or final/output.md (legacy pre-immutability).
   const latestMarkdownArtifact = useMemo(
-    () =>
-      activeRunArtifacts.find(
-        (artifact) =>
-          artifact.run_id === selectedRunId &&
-          (artifact.path === "final/output.md" || artifact.path.endsWith("/final/output.md"))
-      ) ?? null,
-    [activeRunArtifacts, selectedRunId]
+    () => activeRunArtifacts.find((artifact) => artifact.path === "final/output.md") ?? null,
+    [activeRunArtifacts]
   );
   const latestPdfArtifact = useMemo(
-    () =>
-      activeRunArtifacts.find(
-        (artifact) =>
-          artifact.run_id === selectedRunId &&
-          (artifact.path === "final/output.pdf" || artifact.path.endsWith("/final/output.pdf"))
-      ) ?? null,
-    [activeRunArtifacts, selectedRunId]
+    () => activeRunArtifacts.find((artifact) => artifact.path === "final/output.pdf") ?? null,
+    [activeRunArtifacts]
   );
 
   const nodeExecutions = useMemo(
@@ -243,6 +270,11 @@ export default function WorkspacePage() {
     }
     const detail = await apiFetch<RunDetail>(`/runs/${runId}`);
     setSelectedRun(detail);
+    setRuns((current) =>
+      current.some((run) => run.id === detail.id)
+        ? current.map((run) => (run.id === detail.id ? toRunSummary(detail) : run))
+        : [toRunSummary(detail), ...current]
+    );
     return detail;
   }, []);
 
@@ -259,11 +291,6 @@ export default function WorkspacePage() {
   const loadTemplates = useCallback(async () => {
     const list = await apiFetch<Template[]>("/templates");
     setTemplates(list);
-    setProjectTemplateId((current) => {
-      if (current && list.some((tpl) => tpl.id === current)) return current;
-      const docGen = list.find((tpl) => tpl.slug === "document_generator");
-      return docGen?.id ?? list[0]?.id ?? "";
-    });
   }, []);
 
   // Heavy refresh: pulls every project-scoped collection. Used on first load
@@ -297,8 +324,6 @@ export default function WorkspacePage() {
       } else {
         setSelectedRun(null);
       }
-      // Chat thread is run-scoped; load it via the dedicated effect that
-      // re-runs whenever selectedRunId changes (see below).
       if (!runIdToSelect) {
         setMessages([]);
       }
@@ -306,20 +331,27 @@ export default function WorkspacePage() {
     [loadRunDetail, selectedRunId]
   );
 
-  // Light refresh: just the runs list. Called on terminal SSE events so the
-  // sidebar reflects the latest status without re-fetching files/messages.
   const refreshRunsList = useCallback(async (projectId: string) => {
     if (!projectId) return;
     const nextRuns = await apiFetch<Run[]>(`/projects/${projectId}/runs`);
     setRuns(nextRuns);
   }, []);
 
-  // Light refresh: project files (used after a run completes so the Files
-  // tab and the explorer drawer pick up newly-written artifacts).
   const refreshProjectFiles = useCallback(async (projectId: string) => {
     if (!projectId) return;
     const nextFiles = await apiFetch<Artifact[]>(`/projects/${projectId}/files`);
     setFiles(nextFiles);
+  }, []);
+
+  const refreshRunMessages = useCallback(async (projectId: string, runId: string) => {
+    if (!projectId || !runId) {
+      setMessages([]);
+      return;
+    }
+    const nextMessages = await apiFetch<ChatMessage[]>(
+      `/projects/${projectId}/messages?run_id=${encodeURIComponent(runId)}`
+    );
+    setMessages(nextMessages);
   }, []);
 
   const loadArtifactPreview = useCallback(async (artifact: Artifact) => {
@@ -404,14 +436,12 @@ export default function WorkspacePage() {
       setMessages([]);
       return;
     }
-    apiFetch<ChatMessage[]>(
-      `/projects/${selectedProjectId}/messages?run_id=${encodeURIComponent(selectedRunId)}`
-    )
-      .then(setMessages)
+    refreshRunMessages(selectedProjectId, selectedRunId)
+      .then(() => undefined)
       .catch((err) => {
         setError(err instanceof Error ? err.message : "Failed to load chat for this run.");
       });
-  }, [selectedProjectId, selectedRunId]);
+  }, [refreshRunMessages, selectedProjectId, selectedRunId]);
 
   // SSE for the selected run.
   useEffect(() => {
@@ -463,14 +493,14 @@ export default function WorkspacePage() {
         // and project files (so the Files tab + explorer drawer pick up
         // newly-written run artifacts), and re-fetch this run's chat
         // (so the assistant/system completion message appears).
+        if (payload.type === "artifact.created" || payload.type === "node.completed") {
+          refreshProjectFiles(selectedProjectId).catch(() => undefined);
+        }
+
         if (TERMINAL_EVENTS.has(payload.type)) {
           refreshRunsList(selectedProjectId).catch(() => undefined);
           refreshProjectFiles(selectedProjectId).catch(() => undefined);
-          apiFetch<ChatMessage[]>(
-            `/projects/${selectedProjectId}/messages?run_id=${encodeURIComponent(selectedRunId)}`
-          )
-            .then(setMessages)
-            .catch(() => undefined);
+          refreshRunMessages(selectedProjectId, selectedRunId).catch(() => undefined);
         }
 
         // Don't close the stream on `run.paused` — a Continue might
@@ -495,7 +525,7 @@ export default function WorkspacePage() {
       source.close();
       if (eventSourceRef.current === source) eventSourceRef.current = null;
     };
-  }, [loadRunDetail, refreshProjectFiles, refreshRunsList, selectedProjectId, selectedRunId]);
+  }, [loadRunDetail, refreshProjectFiles, refreshRunMessages, refreshRunsList, selectedProjectId, selectedRunId]);
 
   // Auto-load preview when output viewer or artifacts change.
   useEffect(() => {
@@ -521,7 +551,7 @@ export default function WorkspacePage() {
   // Auto-scroll chat to bottom on new messages.
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, selectedRun?.status]);
+  }, [selectedRun?.status, visibleMessages.length]);
 
   async function handleCreateProject() {
     if (!projectName.trim()) return;
@@ -533,7 +563,6 @@ export default function WorkspacePage() {
         body: JSON.stringify({
           name: projectName.trim(),
           description: projectDescription.trim(),
-          template_id: projectTemplateId || null,
         }),
       });
       setProjects((current) => [project, ...current.filter((item) => item.id !== project.id)]);
@@ -649,77 +678,17 @@ export default function WorkspacePage() {
     }
   }
 
-  async function handleSetStopPoint(nodeId: string) {
-    if (!selectedRunId) return;
-    setError(null);
-    try {
-      const updated = await apiFetch<Run>(`/runs/${selectedRunId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ stop_after_node_id: nodeId }),
-      });
-      // Refresh both the run summary and the detailed run state.
-      setSelectedRun((current) =>
-        current && current.id === updated.id ? { ...current, ...updated } : current
-      );
-      setRuns((current) =>
-        current.map((run) => (run.id === updated.id ? { ...run, ...updated } : run))
-      );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to set stop point.");
-    }
-  }
-
-  async function handleClearStopPoint() {
-    if (!selectedRunId) return;
-    setError(null);
-    try {
-      const updated = await apiFetch<Run>(`/runs/${selectedRunId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ stop_after_node_id: null }),
-      });
-      setSelectedRun((current) =>
-        current && current.id === updated.id ? { ...current, ...updated } : current
-      );
-      setRuns((current) =>
-        current.map((run) => (run.id === updated.id ? { ...run, ...updated } : run))
-      );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to clear stop point.");
-    }
-  }
-
   async function handleContinueRun() {
     if (!selectedRunId) return;
     setError(null);
     try {
       await apiFetch<Run>(`/runs/${selectedRunId}/continue`, { method: "POST" });
+      await loadRunDetail(selectedRunId);
       if (selectedProjectId) {
-        await loadProjectData(selectedProjectId, selectedRunId);
+        await refreshRunsList(selectedProjectId);
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to continue run.");
-    }
-  }
-
-  async function handleSaveToVault(artifact: Artifact) {
-    setError(null);
-    const folder = window.prompt("Save to vault folder (e.g. /Proposals or just /)", "/");
-    if (folder === null) return;
-    try {
-      await apiFetch("/vault/from-artifact", {
-        method: "POST",
-        body: JSON.stringify({
-          artifact_id: artifact.id,
-          name: artifact.filename,
-          folder: folder.trim() || "/",
-          notes: selectedProject ? `From project ${selectedProject.name} · ${artifact.path}` : "",
-        }),
-      });
-      // Briefly open the explorer on the vault tab so the user sees it landed.
-      setExplorerInitialTab("vault");
-      setExplorerOpen(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Save to vault failed.");
+    } catch (continueError) {
+      setError(continueError instanceof Error ? continueError.message : "Run resume failed.");
     }
   }
 
@@ -741,8 +710,8 @@ export default function WorkspacePage() {
     <main className="flex h-screen flex-col overflow-hidden bg-slate-50 text-slate-900">
       {showMockBanner ? (
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900">
-          <span>
-            <span className="font-semibold">⚠ Mock AI mode is on</span> — every node returns a
+            <span>
+              <span className="font-semibold">Mock AI mode is on</span> - every node returns a
             canned response without calling OpenRouter. Outputs are fake. To use real models, set
             <span className="mx-1 rounded bg-white px-1 py-0.5 font-mono text-[11px] text-amber-800">MOCK_AI=false</span>
             on the api and worker services and redeploy.
@@ -751,8 +720,8 @@ export default function WorkspacePage() {
       ) : null}
       {showMissingKeyBanner ? (
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-900">
-          <span>
-            <span className="font-semibold">⚠ OPENROUTER_API_KEY is not set.</span> Real-mode runs
+            <span>
+              <span className="font-semibold">OPENROUTER_API_KEY is not set.</span> Real-mode runs
             will fail until you add the key to the api and worker services.
           </span>
         </div>
@@ -774,38 +743,10 @@ export default function WorkspacePage() {
           </div>
 
           <div className="space-y-2 border-b border-slate-200 px-5 py-4">
-            <Link
-              className="flex items-center justify-between rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm font-semibold text-blue-900 shadow-sm hover:bg-blue-100"
-              href="/templates"
-            >
-              <span className="flex items-center gap-2">
-                <span aria-hidden>⚙︎</span>
-                Templates &amp; nodes
-              </span>
-              <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-blue-700">
-                {templates.length}
-              </span>
-            </Link>
-            <button
-              type="button"
-              className="flex w-full items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-900 shadow-sm hover:bg-emerald-100"
-              onClick={() => {
-                setExplorerInitialTab("project");
-                setExplorerOpen(true);
-              }}
-            >
-              <span className="flex items-center gap-2">
-                <span aria-hidden>📁</span>
-                Files &amp; Vault
-              </span>
-              <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-emerald-700">
-                Open
-              </span>
-            </button>
-            <p className="text-[10px] leading-tight text-slate-500">
-              Browse this project's files. Save anything to your permanent Vault before deleting the
-              project.
-            </p>
+            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
+              Submit a document request from the composer below. Each request creates a run, updates
+              the node flow on the right, and writes files into the project workspace.
+            </div>
           </div>
 
           <div className="flex-1 overflow-y-auto">
@@ -835,19 +776,6 @@ export default function WorkspacePage() {
                   value={projectDescription}
                   onChange={(event) => setProjectDescription(event.target.value)}
                 />
-                <select
-                  className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-                  value={projectTemplateId}
-                  onChange={(event) => setProjectTemplateId(event.target.value)}
-                >
-                  <option value="">Default template</option>
-                  {templates.map((tpl) => (
-                    <option key={tpl.id} value={tpl.id}>
-                      {tpl.name}
-                      {tpl.is_seeded ? " (seeded)" : ""}
-                    </option>
-                  ))}
-                </select>
                 <button
                   className="mt-2 w-full rounded-lg bg-slate-950 px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"
                   disabled={isCreatingProject || !projectName.trim()}
@@ -934,23 +862,9 @@ export default function WorkspacePage() {
                 {selectedProject?.name ?? "Select a project"}
               </h2>
               <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                {activeTemplate ? (
-                  <Link
-                    className="inline-flex items-center gap-1.5 rounded-full bg-slate-900 px-3 py-1 text-[11px] font-semibold text-white hover:bg-slate-800"
-                    href={`/templates/${activeTemplate.id}`}
-                    title="Open the template builder for this project"
-                  >
-                    <span>{activeTemplate.name}</span>
-                    <span aria-hidden>↗</span>
-                  </Link>
-                ) : (
-                  <Link
-                    className="inline-flex items-center gap-1.5 rounded-full border border-slate-300 bg-white px-3 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
-                    href="/templates"
-                  >
-                    Pick a template ↗
-                  </Link>
-                )}
+                <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold text-slate-700">
+                  Workflow: Document Generator
+                </span>
                 {selectedProject ? (
                   <span className="font-mono">Root: {selectedProject.r2_root_prefix}</span>
                 ) : (
@@ -958,21 +872,26 @@ export default function WorkspacePage() {
                 )}
               </div>
             </div>
-            <div className="flex shrink-0 items-center gap-2">
-              {activeTemplate ? (
-                <Link
-                  className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-                  href={`/templates/${activeTemplate.id}`}
-                >
-                  Edit nodes
-                </Link>
-              ) : null}
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <select
+                className="min-w-[220px] rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700"
+                value={selectedRunId}
+                onChange={(event) => void handleSelectRun(event.target.value)}
+                disabled={runs.length === 0}
+              >
+                <option value="">{runs.length === 0 ? "No runs yet" : "Select a run"}</option>
+                {runs.map((run) => (
+                  <option key={run.id} value={run.id}>
+                    {run.status} - {run.input_message.slice(0, 48)}
+                  </option>
+                ))}
+              </select>
               {selectedProject ? (
                 <button
                   type="button"
                   className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-50"
                   onClick={() => setDeleteModalOpen(true)}
-                  title="Delete this project, its files, and (optionally) the Vault items copied from it"
+                  title="Delete this project and its files"
                 >
                   Delete project
                 </button>
@@ -987,6 +906,15 @@ export default function WorkspacePage() {
                   {selectedRunSummary.status}
                 </span>
               ) : null}
+              {selectedRunSummary?.status === "paused" ? (
+                <button
+                  type="button"
+                  className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white"
+                  onClick={() => void handleContinueRun()}
+                >
+                  Continue run
+                </button>
+              ) : null}
             </div>
           </header>
 
@@ -997,17 +925,18 @@ export default function WorkspacePage() {
           ) : (
             <>
               <div className="flex-1 overflow-y-auto px-6 py-6">
-                {messages.length === 0 ? (
+                {visibleMessages.length === 0 ? (
                   <div className="mx-auto max-w-2xl rounded-3xl border border-dashed border-slate-300 bg-slate-50 px-6 py-12 text-center">
                     <h3 className="text-base font-semibold text-slate-900">Describe the document you want.</h3>
                     <p className="mt-2 text-sm text-slate-500">
-                      Type a request below and click Run. The {activeTemplate?.name ?? "active template"} will
-                      execute its nodes and you'll see live progress on the right.
+                      {selectedRunId
+                        ? "This run has no chat messages yet. Watch the node flow and logs on the right."
+                        : "Type a request below and click Run. The Document Generator workflow will execute and you'll see live progress on the right."}
                     </p>
                   </div>
                 ) : (
                   <div className="mx-auto flex max-w-3xl flex-col gap-4">
-                    {messages.map((message) => (
+                    {visibleMessages.map((message) => (
                       <article
                         key={message.id}
                         className={clsx("rounded-3xl px-5 py-4 text-sm shadow-sm", {
@@ -1036,8 +965,8 @@ export default function WorkspacePage() {
                       className="block w-full resize-none rounded-3xl bg-transparent px-5 py-4 text-sm text-slate-900 outline-none"
                       placeholder={
                         activeTemplate
-                          ? `Ask the system to run "${activeTemplate.name}". The composer is the entry point.`
-                          : "Describe the document you want…"
+                          ? "Describe the document you want. The composer is the entry point."
+                          : "Describe the document you want..."
                       }
                       rows={3}
                       value={messageInput}
@@ -1059,7 +988,7 @@ export default function WorkspacePage() {
                         >
                           {isUploadingFiles ? "Uploading…" : "Upload file"}
                         </button>
-                        <span className="text-[11px] text-slate-400">⌘/Ctrl+Enter to run</span>
+                        <span className="text-[11px] text-slate-400">Ctrl+Enter to run</span>
                       </div>
                       <button
                         className="rounded-xl bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm shadow-blue-600/20 disabled:opacity-50"
@@ -1102,12 +1031,12 @@ export default function WorkspacePage() {
             {activeTab === "flow" ? (
               selectedRun && templateNodes.length > 0 ? (
                 <div className="space-y-3">
-                  {/* Run header: status + continue/clear-stop controls */}
+                  {/* Run header */}
                   <div className="rounded-xl border border-slate-200 bg-white p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="min-w-0">
                         <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                          Run · {selectedRun.id}
+                          Run | {selectedRun.id}
                         </p>
                         <p className="mt-0.5 truncate text-[11px] text-slate-500">
                           {selectedRun.input_message}
@@ -1118,58 +1047,17 @@ export default function WorkspacePage() {
                           "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
                           statusTone(selectedRun.status)
                         )}
-                      >
-                        {selectedRun.status}
-                      </span>
+                        >
+                          {selectedRun.status}
+                        </span>
                     </div>
-                    {selectedRun.status === "paused" || selectedRun.stop_after_node_id ? (
-                      <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs">
-                        <span className="font-semibold text-amber-900">
-                          {selectedRun.status === "paused"
-                            ? `Paused after ${
-                                templateNodes.find((n) => n.id === selectedRun.stop_after_node_id)
-                                  ?.name ?? "step"
-                              }`
-                            : `Will stop after ${
-                                templateNodes.find((n) => n.id === selectedRun.stop_after_node_id)
-                                  ?.name ?? "step"
-                              }`}
-                        </span>
-                        <span className="ml-auto flex gap-2">
-                          {selectedRun.status === "paused" ? (
-                            <button
-                              type="button"
-                              className="rounded-md bg-emerald-600 px-3 py-1 text-[11px] font-semibold text-white hover:bg-emerald-700"
-                              onClick={() => void handleContinueRun()}
-                            >
-                              ▶ Continue
-                            </button>
-                          ) : null}
-                          {selectedRun.stop_after_node_id ? (
-                            <button
-                              type="button"
-                              className="rounded-md border border-slate-300 bg-white px-3 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
-                              onClick={() => void handleClearStopPoint()}
-                            >
-                              Clear stop
-                            </button>
-                          ) : null}
-                        </span>
-                      </div>
-                    ) : null}
                   </div>
 
                   {/* Vertical stack of nodes */}
                   {templateNodes.map((tplNode, index) => {
                     const exec = nodeExecutions.get(tplNode.id);
                     const status = exec?.status ?? "waiting";
-                    const isStopPoint = selectedRun.stop_after_node_id === tplNode.id;
-                    const isPausedHere =
-                      selectedRun.status === "paused" && isStopPoint;
                     const isSelected = tplNode.id === selectedNodeId;
-                    // Match by node_id within this run — paths are now run-scoped
-                    // (runs/<run_id>/<configured-path>) so direct path equality with
-                    // the template's logical path no longer works.
                     const artifact =
                       selectedRun.artifacts?.find(
                         (a) =>
@@ -1182,7 +1070,7 @@ export default function WorkspacePage() {
                       exec?.model_used ??
                       tplNode.model ??
                       tplNode.model_profile ??
-                      (tplNode.type === "pdf_generator" ? "no model" : "—");
+                      (tplNode.type === "pdf_generator" ? "no model" : "-");
                     return (
                       <div key={tplNode.id}>
                         {/* Node card */}
@@ -1192,16 +1080,14 @@ export default function WorkspacePage() {
                             "block w-full rounded-xl border p-3 text-left transition",
                             isSelected
                               ? "border-slate-900 bg-white shadow-md"
-                              : "border-slate-200 bg-white hover:border-slate-300",
-                            isPausedHere && "ring-2 ring-amber-400",
-                            isStopPoint && !isPausedHere && "ring-1 ring-amber-300"
+                              : "border-slate-200 bg-white hover:border-slate-300"
                           )}
                           onClick={() => setSelectedNodeId(tplNode.id)}
                         >
                           <div className="flex items-start justify-between gap-3">
                             <div className="min-w-0">
                               <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                                Step {index + 1} · {tplNode.type}
+                                Step {index + 1} | {tplNode.type}
                               </p>
                               <h3 className="mt-0.5 text-sm font-semibold text-slate-900">
                                 {tplNode.name}
@@ -1224,10 +1110,10 @@ export default function WorkspacePage() {
                             <div>
                               <dt className="text-slate-500">Tokens / Cost</dt>
                               <dd className="mt-0.5 text-slate-700">
-                                {(exec?.token_input ?? 0) + (exec?.token_output ?? 0)} ·{" "}
+                                {(exec?.token_input ?? 0) + (exec?.token_output ?? 0)} |{" "}
                                 {exec?.cost_estimate != null
                                   ? `$${exec.cost_estimate.toFixed(4)}`
-                                  : "—"}
+                                  : "-"}
                               </dd>
                             </div>
                             {tplNode.reads?.length ? (
@@ -1244,32 +1130,6 @@ export default function WorkspacePage() {
                               {exec.error_message}
                             </div>
                           ) : null}
-                          <div className="mt-2 flex flex-wrap gap-1.5">
-                            <span
-                              role="button"
-                              tabIndex={0}
-                              className={clsx(
-                                "cursor-pointer rounded-md px-2 py-0.5 text-[10px] font-semibold transition",
-                                isStopPoint
-                                  ? "bg-amber-500 text-white hover:bg-amber-600"
-                                  : "border border-slate-200 bg-white text-slate-600 hover:bg-amber-50 hover:text-amber-800"
-                              )}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                if (isStopPoint) void handleClearStopPoint();
-                                else void handleSetStopPoint(tplNode.id);
-                              }}
-                              onKeyDown={(event) => {
-                                if (event.key !== "Enter" && event.key !== " ") return;
-                                event.preventDefault();
-                                event.stopPropagation();
-                                if (isStopPoint) void handleClearStopPoint();
-                                else void handleSetStopPoint(tplNode.id);
-                              }}
-                            >
-                              {isStopPoint ? "■ Stops here" : "⏸ Stop after"}
-                            </span>
-                          </div>
                         </button>
 
                         {/* File arrow between this node and the next */}
@@ -1339,13 +1199,6 @@ export default function WorkspacePage() {
                             >
                               download
                             </button>
-                            <button
-                              type="button"
-                              className="rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800 hover:bg-emerald-100"
-                              onClick={() => void handleSaveToVault(artifact)}
-                            >
-                              Save to Vault
-                            </button>
                           </div>
                         ) : null}
                       </div>
@@ -1355,7 +1208,7 @@ export default function WorkspacePage() {
                   {/* Selected node JSON inspector */}
                   <details className="rounded-xl border border-slate-200 bg-white p-3 text-xs">
                     <summary className="cursor-pointer font-semibold text-slate-700">
-                      Selected node — JSON inspector
+                      Selected node - JSON inspector
                     </summary>
                     <div className="mt-3 space-y-2">
                       <div>
@@ -1402,23 +1255,100 @@ export default function WorkspacePage() {
             {/* FILES */}
             {activeTab === "files" ? (
               <div className="space-y-5">
-                {(["input", "working", "final", "logs", "archive"] as const).map((group) => (
+                <section>
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <h3 className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
+                      Project input files
+                    </h3>
+                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                      {projectInputFiles.length}
+                    </span>
+                  </div>
+                  {projectInputFiles.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs text-slate-500">
+                      No uploaded input files yet.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {projectInputFiles.map((artifact) => (
+                        <div
+                          key={`${artifact.id}-${artifact.path}`}
+                          className="rounded-xl border border-slate-200 bg-white p-3"
+                        >
+                          <div className="flex flex-col gap-2">
+                            <div>
+                              <p className="truncate text-sm font-semibold text-slate-900">
+                                {artifact.filename}
+                              </p>
+                              <p className="mt-0.5 break-all text-[10px] text-slate-500">
+                                {artifact.path}
+                              </p>
+                              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-slate-500">
+                                <span>{artifact.mime_type}</span>
+                                <span>{formatBytes(artifact.size_bytes)}</span>
+                                <span>{formatDateTime(artifact.created_at)}</span>
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              <button
+                                className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
+                                onClick={() =>
+                                  loadArtifactPreview(artifact).catch((err) =>
+                                    setPreviewError(
+                                      err instanceof Error ? err.message : "Preview failed."
+                                    )
+                                  )
+                                }
+                              >
+                                Preview
+                              </button>
+                              <button
+                                className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
+                                onClick={() => void handleDownload(artifact)}
+                              >
+                                Download
+                              </button>
+                              <button
+                                className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
+                                onClick={() => navigator.clipboard.writeText(artifact.path).catch(() => undefined)}
+                              >
+                                Copy path
+                              </button>
+                              <button
+                                className="rounded-md border border-red-200 px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50"
+                                onClick={() => void handleDelete(artifact)}
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+                <section className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3 text-xs text-slate-600">
+                  {selectedRun
+                    ? `Selected run artifacts are shown below for run ${selectedRun.id}.`
+                    : "Select a run to inspect working, final, log, and archive artifacts."}
+                </section>
+                {(["working", "final", "logs", "archive"] as const).map((group) => (
                   <section key={group}>
                     <div className="mb-2 flex items-center justify-between gap-3">
                       <h3 className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
                         {group}
                       </h3>
                       <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
-                        {filesByGroup[group].length}
+                        {runFilesByGroup[group].length}
                       </span>
                     </div>
-                    {filesByGroup[group].length === 0 ? (
+                    {runFilesByGroup[group].length === 0 ? (
                       <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs text-slate-500">
-                        Empty.
+                        {selectedRun ? "Empty for this run." : "Select a run first."}
                       </div>
                     ) : (
                       <div className="space-y-2">
-                        {filesByGroup[group].map((artifact) => (
+                        {runFilesByGroup[group].map((artifact) => (
                           <div
                             key={`${artifact.id}-${artifact.path}`}
                             className="rounded-xl border border-slate-200 bg-white p-3"
@@ -1434,6 +1364,7 @@ export default function WorkspacePage() {
                                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-slate-500">
                                   <span>{artifact.mime_type}</span>
                                   <span>{formatBytes(artifact.size_bytes)}</span>
+                                  <span>{formatDateTime(artifact.created_at)}</span>
                                 </div>
                               </div>
                               <div className="flex flex-wrap gap-1.5">
@@ -1464,13 +1395,6 @@ export default function WorkspacePage() {
                                   }
                                 >
                                   Copy path
-                                </button>
-                                <button
-                                  className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-800 hover:bg-emerald-100"
-                                  onClick={() => void handleSaveToVault(artifact)}
-                                  title="Copy this file into your permanent Vault"
-                                >
-                                  Save to Vault
                                 </button>
                                 <button
                                   className="rounded-md border border-red-200 px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50"
@@ -1661,12 +1585,12 @@ export default function WorkspacePage() {
                                   <td className="px-3 py-2 font-medium text-slate-900">{node.node_name}</td>
                                   <td className="px-3 py-2">{node.status}</td>
                                   <td className="px-3 py-2 break-words">
-                                    {node.model_used ?? node.model_profile ?? "—"}
+                                    {node.model_used ?? node.model_profile ?? "-"}
                                   </td>
                                   <td className="px-3 py-2">{node.token_input ?? 0}</td>
                                   <td className="px-3 py-2">{node.token_output ?? 0}</td>
                                   <td className="px-3 py-2">
-                                    {node.cost_estimate != null ? `$${node.cost_estimate.toFixed(4)}` : "—"}
+                                    {node.cost_estimate != null ? `$${node.cost_estimate.toFixed(4)}` : "-"}
                                   </td>
                                 </tr>
                               ))}
@@ -1686,18 +1610,6 @@ export default function WorkspacePage() {
           </div>
         </aside>
       </div>
-
-      <FileExplorerDrawer
-        open={explorerOpen}
-        onClose={() => setExplorerOpen(false)}
-        initialTab={explorerInitialTab}
-        project={selectedProject}
-        onProjectFilesChanged={() => {
-          if (selectedProjectId) {
-            void loadProjectData(selectedProjectId, selectedRunId || undefined);
-          }
-        }}
-      />
 
       <DeleteProjectModal
         open={deleteModalOpen}

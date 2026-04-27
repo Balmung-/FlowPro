@@ -120,6 +120,7 @@ class Artifact(Base):
     run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id", ondelete="SET NULL"), nullable=True, index=True)
     node_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     path: Mapped[str] = mapped_column(String(1024), index=True)
+    storage_path: Mapped[str] = mapped_column(String(1024))
     filename: Mapped[str] = mapped_column(String(255))
     mime_type: Mapped[str] = mapped_column(String(255))
     size_bytes: Mapped[int] = mapped_column()
@@ -247,6 +248,7 @@ def serialize_artifact(artifact: Artifact) -> dict[str, Any]:
         "run_id": artifact.run_id,
         "node_id": artifact.node_id,
         "path": artifact.path,
+        "storage_path": artifact.storage_path,
         "filename": artifact.filename,
         "mime_type": artifact.mime_type,
         "size_bytes": artifact.size_bytes,
@@ -282,4 +284,3 @@ def serialize_vault_item(item: VaultItem) -> dict[str, Any]:
         "created_at": iso(item.created_at),
         "updated_at": iso(item.updated_at),
     }
-

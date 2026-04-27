@@ -218,20 +218,7 @@ class StorageService:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: getattr(self.client, operation)(**kwargs))
 
-    async def write_file(
-        self,
-        db: AsyncSession,
-        project: Project,
-        relative_path: str,
-        content: bytes | str,
-        mime_type: str,
-        created_by: str,
-        run_id: str | None = None,
-        node_id: str | None = None,
-    ) -> Artifact:
-        safe_path = self.validate_relative_path(relative_path)
-        object_key = self.build_object_key(project, safe_path)
-        payload = content if isinstance(content, bytes) else content.encode("utf-8")
+    async def _put_object_with_retry(self, object_key: str, payload: bytes, mime_type: str) -> None:
         attempts = 0
         while True:
             try:
@@ -242,11 +229,31 @@ class StorageService:
                     Body=payload,
                     ContentType=mime_type,
                 )
-                break
+                return
             except Exception:
                 attempts += 1
                 if attempts >= 2:
                     raise
+
+    async def write_file(
+        self,
+        db: AsyncSession,
+        project: Project,
+        relative_path: str,
+        content: bytes | str,
+        mime_type: str,
+        created_by: str,
+        run_id: str | None = None,
+        node_id: str | None = None,
+        storage_path: str | None = None,
+    ) -> Artifact:
+        safe_path = self.validate_relative_path(relative_path)
+        safe_storage_path = self.validate_relative_path(storage_path) if storage_path else safe_path
+        object_key = self.build_object_key(project, safe_storage_path)
+        payload = content if isinstance(content, bytes) else content.encode("utf-8")
+        await self._put_object_with_retry(object_key, payload, mime_type)
+        if safe_storage_path != safe_path:
+            await self._put_object_with_retry(self.build_object_key(project, safe_path), payload, mime_type)
 
         artifact = Artifact(
             id=generate_id("art"),
@@ -254,6 +261,7 @@ class StorageService:
             run_id=run_id,
             node_id=node_id,
             path=safe_path,
+            storage_path=safe_storage_path,
             filename=PurePosixPath(safe_path).name,
             mime_type=mime_type,
             size_bytes=len(payload),
@@ -268,25 +276,64 @@ class StorageService:
         response = await self._run_s3("get_object", Bucket=settings.cloudflare_r2_bucket, Key=object_key)
         return response["Body"].read()
 
+    async def read_artifact(self, project: Project, artifact: Artifact) -> bytes:
+        return await self.read_file(project, artifact.storage_path or artifact.path)
+
     async def list_files(self, db: AsyncSession, project_id: str, prefix: str = "") -> list[Artifact]:
-        """Return only DB-backed (and not soft-deleted) artifacts. We deliberately do NOT
-        fabricate Artifact rows from raw R2 listings: every row returned here must have a
-        real id so the frontend's preview/download/delete actions can resolve to a row.
-        """
         project = await db.get(Project, project_id)
         if not project:
             return []
 
-        statement = select(Artifact).where(
-            Artifact.project_id == project_id,
-            Artifact.deleted_at.is_(None),
+        safe_prefix = self.validate_relative_path(prefix) if prefix else ""
+        root_prefix = f"{project.r2_root_prefix.rstrip('/')}/"
+        list_prefix = root_prefix
+        if safe_prefix:
+            list_prefix = f"{root_prefix}{safe_prefix.rstrip('/')}"
+            if not list_prefix.endswith("/"):
+                list_prefix = f"{list_prefix}/"
+
+        objects: list[dict[str, Any]] = []
+        continuation_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "Bucket": settings.cloudflare_r2_bucket,
+                "Prefix": list_prefix,
+                "MaxKeys": 1000,
+            }
+            if continuation_token:
+                params["ContinuationToken"] = continuation_token
+            response = await self._run_s3("list_objects_v2", **params)
+            objects.extend(response.get("Contents", []))
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+
+        result = await db.execute(
+            select(Artifact)
+            .where(Artifact.project_id == project_id, Artifact.deleted_at.is_(None))
+            .order_by(desc(Artifact.created_at))
         )
-        if prefix:
-            safe_prefix = self.validate_relative_path(prefix).rstrip("/")
-            statement = statement.where(Artifact.path.startswith(f"{safe_prefix}/"))
-        statement = statement.order_by(desc(Artifact.created_at))
-        result = await db.execute(statement)
-        return list(result.scalars().all())
+        latest_by_path: dict[str, Artifact] = {}
+        for artifact in result.scalars().all():
+            if artifact.path not in latest_by_path:
+                latest_by_path[artifact.path] = artifact
+
+        files: list[Artifact] = []
+        for item in objects:
+            key = item.get("Key", "")
+            if not key or key.endswith("/"):
+                continue
+            relative_path = key[len(root_prefix):] if key.startswith(root_prefix) else key
+            if relative_path.startswith("runs/"):
+                continue
+            artifact = latest_by_path.get(relative_path)
+            if not artifact:
+                continue
+            artifact.size_bytes = int(item.get("Size", artifact.size_bytes))
+            files.append(artifact)
+
+        files.sort(key=lambda artifact: artifact.created_at, reverse=True)
+        return files
 
     async def delete_project_tree(self, project: Project) -> int:
         """List + batch-delete every R2 object under the project's root prefix.
@@ -328,22 +375,45 @@ class StorageService:
             select(Artifact).where(
                 Artifact.project_id == project.id,
                 Artifact.path == safe_path,
+                Artifact.deleted_at.is_(None),
             ).order_by(desc(Artifact.created_at))
         )
-        artifacts = list(result.scalars().all())
-        artifact = artifacts[0] if artifacts else None
+        artifact = result.scalars().first()
         if artifact is None:
             raise HTTPException(status_code=404, detail="Artifact not found.")
+        return await self.delete_artifact(db, project, artifact)
+
+    async def delete_artifact(self, db: AsyncSession, project: Project, artifact: Artifact) -> Artifact:
+        if artifact.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Artifact not found.")
+
+        latest_result = await db.execute(
+            select(Artifact)
+            .where(
+                Artifact.project_id == project.id,
+                Artifact.path == artifact.path,
+                Artifact.deleted_at.is_(None),
+            )
+            .order_by(desc(Artifact.created_at))
+            .limit(1)
+        )
+        latest = latest_result.scalars().first()
+        delete_current_copy = latest is not None and latest.id == artifact.id
 
         await self._run_s3(
             "delete_object",
             Bucket=settings.cloudflare_r2_bucket,
-            Key=self.build_object_key(project, safe_path),
+            Key=self.build_object_key(project, artifact.storage_path or artifact.path),
         )
-        deleted_at = utcnow()
-        for candidate in artifacts:
-            candidate.deleted_at = deleted_at
-        logger.info("Deleted project file %s for project %s", safe_path, project.id)
+        if delete_current_copy and (artifact.storage_path or artifact.path) != artifact.path:
+            await self._run_s3(
+                "delete_object",
+                Bucket=settings.cloudflare_r2_bucket,
+                Key=self.build_object_key(project, artifact.path),
+            )
+
+        artifact.deleted_at = utcnow()
+        logger.info("Deleted project artifact %s for project %s", artifact.path, project.id)
         await db.flush()
         return artifact
 
@@ -376,6 +446,9 @@ class StorageService:
                 ExpiresIn=3600,
             ),
         )
+
+    async def get_artifact_download_url(self, project: Project, artifact: Artifact) -> str:
+        return await self.get_signed_download_url(project, artifact.storage_path or artifact.path)
 
     async def get_object_metadata(self, project: Project, relative_path: str) -> dict[str, Any]:
         safe_path = self.validate_relative_path(relative_path)
@@ -467,7 +540,7 @@ class StorageService:
         """Server-side copy an artifact's R2 object into the vault key.
         Returns the size of the copied object in bytes.
         """
-        source_key = self.build_object_key(project, artifact.path)
+        source_key = self.build_object_key(project, artifact.storage_path or artifact.path)
         await self._run_s3(
             "copy_object",
             Bucket=settings.cloudflare_r2_bucket,
@@ -490,13 +563,16 @@ class StorageService:
         created_by: str,
         run_id: str | None = None,
         node_id: str | None = None,
+        storage_path: str | None = None,
     ) -> Artifact:
+        safe_path = self.validate_relative_path(path)
         artifact = Artifact(
             id=generate_id("art"),
             project_id=project_id,
             run_id=run_id,
             node_id=node_id,
-            path=self.validate_relative_path(path),
+            path=safe_path,
+            storage_path=self.validate_relative_path(storage_path) if storage_path else safe_path,
             filename=filename,
             mime_type=mime_type,
             size_bytes=size_bytes,
@@ -996,19 +1072,20 @@ class WorkflowService:
                 payload_text = content
                 mime_type = "text/markdown"
 
-            # Write to a run-scoped path so old runs remain inspectable. The
-            # template config holds the *logical* path (e.g. "working/intent.json");
-            # the actual R2 key becomes "runs/<run_id>/<logical_path>".
+            # Preserve both:
+            # - logical project path, used by the Files tab and template semantics
+            # - immutable run-scoped storage path, used to inspect historical runs
             run_scoped_path = f"runs/{run.id}/{node_config['output']['path']}"
             artifact = await self.storage.write_file(
                 db,
                 project,
-                run_scoped_path,
+                node_config["output"]["path"],
                 payload_text,
                 mime_type,
                 "node",
                 run.id,
                 node_config["id"],
+                storage_path=run_scoped_path,
             )
 
             section = node_config["output"]["state_section"]
@@ -1067,7 +1144,7 @@ class WorkflowService:
             artifact = await db.get(Artifact, artifact_id)
             if not artifact:
                 continue
-            raw = await self.storage.read_file(project, artifact.path)
+            raw = await self.storage.read_artifact(project, artifact)
             return raw.decode("utf-8"), ref
         return "", None
 
@@ -1103,12 +1180,13 @@ class WorkflowService:
             artifact = await self.storage.write_file(
                 db,
                 project,
-                run_scoped_path,
+                node_config["output"]["path"],
                 pdf_bytes,
                 "application/pdf",
                 "node",
                 run.id,
                 node_config["id"],
+                storage_path=run_scoped_path,
             )
 
             section = node_config["output"]["state_section"]
@@ -1161,7 +1239,7 @@ class WorkflowService:
             if not artifact or artifact.deleted_at is not None:
                 continue
             try:
-                raw = await self.storage.read_file(project, artifact.path)
+            raw = await self.storage.read_artifact(project, artifact)
             except Exception:
                 continue
             try:
