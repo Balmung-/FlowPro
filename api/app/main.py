@@ -23,6 +23,7 @@ from app.models import (
     Project,
     Run,
     RunEvent,
+    Template,
     User,
     generate_id,
     serialize_artifact,
@@ -31,10 +32,12 @@ from app.models import (
     serialize_project,
     serialize_run,
     serialize_run_event,
+    serialize_template,
     serialize_user,
     utcnow,
 )
-from app.services import StorageService, WorkflowService
+from app.services import StorageService, WorkflowService, validate_template_config
+from app.templates_seed import SEED_TEMPLATES
 
 app = FastAPI(title="FlowPro API", version="0.1.0")
 storage_service = StorageService()
@@ -55,11 +58,26 @@ class LoginRequest(BaseModel):
 class ProjectCreateRequest(BaseModel):
     name: str
     description: str = ""
+    template_id: str | None = None
 
 
 class ProjectUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
+    template_id: str | None = None
+
+
+class TemplateCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    config_json: dict
+    slug: str | None = None
+
+
+class TemplateUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    config_json: dict | None = None
 
 
 class MessageCreateRequest(BaseModel):
@@ -99,6 +117,40 @@ async def startup() -> None:
                 )
             )
             await session.commit()
+
+        # Seed default templates if not present (idempotent by slug).
+        for seed in SEED_TEMPLATES:
+            existing = await session.execute(select(Template).where(Template.slug == seed["slug"]))
+            current = existing.scalar_one_or_none()
+            if current is None:
+                session.add(
+                    Template(
+                        id=generate_id("tpl"),
+                        slug=seed["slug"],
+                        name=seed["name"],
+                        description=seed["description"],
+                        config_json=seed["config_json"],
+                        is_seeded=True,
+                    )
+                )
+            else:
+                # Refresh seeded templates' config so updates ship via deploy.
+                if current.is_seeded:
+                    current.name = seed["name"]
+                    current.description = seed["description"]
+                    current.config_json = seed["config_json"]
+                    current.updated_at = utcnow()
+        await session.commit()
+
+        # Backfill template_id for projects that pre-date the templates table.
+        # Runs after seeding so the document_generator template definitely exists.
+        await session.execute(
+            text(
+                "UPDATE projects SET template_id = (SELECT id FROM templates WHERE slug = 'document_generator' LIMIT 1) "
+                "WHERE template_id IS NULL AND EXISTS (SELECT 1 FROM templates WHERE slug = 'document_generator')"
+            )
+        )
+        await session.commit()
 
 
 app.add_middleware(
@@ -189,10 +241,22 @@ async def create_project(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    template_id = payload.template_id
+    if template_id is None:
+        # Default to seeded document_generator if available.
+        result = await db.execute(select(Template).where(Template.slug == "document_generator"))
+        seeded = result.scalar_one_or_none()
+        template_id = seeded.id if seeded else None
+    elif template_id:
+        template = await db.get(Template, template_id)
+        if template is None:
+            raise HTTPException(status_code=400, detail="Template not found.")
+
     project_id = generate_id("proj")
     project = Project(
         id=project_id,
         user_id=current_user.id,
+        template_id=template_id,
         name=payload.name.strip(),
         description=payload.description.strip(),
         r2_root_prefix=f"projects/{project_id}/",
@@ -224,6 +288,14 @@ async def update_project(
         project.name = payload.name.strip()
     if payload.description is not None:
         project.description = payload.description.strip()
+    if payload.template_id is not None:
+        if payload.template_id == "":
+            project.template_id = None
+        else:
+            template = await db.get(Template, payload.template_id)
+            if template is None:
+                raise HTTPException(status_code=400, detail="Template not found.")
+            project.template_id = payload.template_id
     project.updated_at = utcnow()
     await db.commit()
     return serialize_project(project)
@@ -239,6 +311,159 @@ async def delete_project(
     await db.delete(project)
     await db.commit()
     return {"deleted": True, "project_id": project_id}
+
+
+# ---------------------------------------------------------------------------
+# Templates
+# Templates are global (visible to all authenticated users). Seeded templates
+# are read-only at runtime — a fresh deploy refreshes their config from
+# templates_seed.py. To customize a seeded template, clone it.
+# ---------------------------------------------------------------------------
+
+
+def _slugify(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned or "template"
+
+
+async def _ensure_unique_template_slug(db: AsyncSession, base: str) -> str:
+    candidate = base
+    suffix = 1
+    while True:
+        result = await db.execute(select(Template).where(Template.slug == candidate))
+        if result.scalar_one_or_none() is None:
+            return candidate
+        suffix += 1
+        candidate = f"{base}_{suffix}"
+
+
+@app.get("/templates")
+async def list_templates(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    result = await db.execute(select(Template).order_by(desc(Template.is_seeded), Template.name))
+    return [serialize_template(template) for template in result.scalars().all()]
+
+
+@app.post("/templates")
+async def create_template(
+    payload: TemplateCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Template name is required.")
+
+    config = payload.config_json or {}
+    # Ensure the persisted name matches the request name even if the user forgot to set it inside config_json.
+    config.setdefault("name", name)
+    validate_template_config(config)
+
+    slug_base = _slugify(payload.slug or name)
+    slug = await _ensure_unique_template_slug(db, slug_base)
+
+    template = Template(
+        id=generate_id("tpl"),
+        slug=slug,
+        name=name,
+        description=payload.description.strip(),
+        config_json=config,
+        is_seeded=False,
+    )
+    db.add(template)
+    await db.commit()
+    return serialize_template(template)
+
+
+@app.get("/templates/{template_id}")
+async def get_template(
+    template_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    template = await db.get(Template, template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    return serialize_template(template)
+
+
+@app.patch("/templates/{template_id}")
+async def update_template(
+    template_id: str,
+    payload: TemplateUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    template = await db.get(Template, template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    if template.is_seeded:
+        raise HTTPException(
+            status_code=400,
+            detail="Seeded templates are read-only. Clone this template to customize it.",
+        )
+
+    if payload.name is not None:
+        template.name = payload.name.strip()
+    if payload.description is not None:
+        template.description = payload.description.strip()
+    if payload.config_json is not None:
+        config = dict(payload.config_json)
+        config.setdefault("name", template.name)
+        validate_template_config(config)
+        template.config_json = config
+    template.updated_at = utcnow()
+    await db.commit()
+    return serialize_template(template)
+
+
+@app.delete("/templates/{template_id}")
+async def delete_template(
+    template_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    template = await db.get(Template, template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    if template.is_seeded:
+        raise HTTPException(status_code=400, detail="Seeded templates cannot be deleted.")
+    await db.delete(template)
+    await db.commit()
+    return {"deleted": True, "template_id": template_id}
+
+
+@app.post("/templates/{template_id}/clone")
+async def clone_template(
+    template_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    source = await db.get(Template, template_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Template not found.")
+
+    new_name = f"{source.name} (Copy)"
+    config = dict(source.config_json or {})
+    config["name"] = new_name
+
+    slug = await _ensure_unique_template_slug(db, _slugify(new_name))
+
+    clone = Template(
+        id=generate_id("tpl"),
+        slug=slug,
+        name=new_name,
+        description=source.description,
+        config_json=config,
+        is_seeded=False,
+    )
+    db.add(clone)
+    await db.commit()
+    return serialize_template(clone)
 
 
 @app.get("/projects/{project_id}/messages")

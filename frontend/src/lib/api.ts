@@ -12,9 +12,52 @@ export type User = {
 export type Project = {
   id: string;
   user_id: string;
+  template_id: string | null;
   name: string;
   description: string;
   r2_root_prefix: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ViewerKind = "markdown" | "pdf" | "json" | "raw";
+
+export type NodeOutputFormat = "json" | "markdown" | "pdf";
+
+export type TemplateNodeType = "ai" | "plan" | "pdf_generator";
+
+export type TemplateNodeConfig = {
+  id: string;
+  name: string;
+  type: TemplateNodeType;
+  model_profile: string | null;
+  system_prompt: string;
+  user_prompt_template: string;
+  reads: string[];
+  output: {
+    format: NodeOutputFormat;
+    path: string;
+    state_section: string;
+    state_key: string;
+  };
+  mock_content?: unknown;
+};
+
+export type TemplateConfig = {
+  name: string;
+  description?: string;
+  default_viewer?: ViewerKind;
+  allowed_viewers?: ViewerKind[];
+  nodes: TemplateNodeConfig[];
+};
+
+export type Template = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  config_json: TemplateConfig;
+  is_seeded: boolean;
   created_at: string;
   updated_at: string;
 };

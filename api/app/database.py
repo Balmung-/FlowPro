@@ -31,6 +31,15 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 
 async def init_db() -> None:
     from app import models  # noqa: F401
+    from sqlalchemy import text as sql_text
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # Idempotent column adds for tables that pre-existed before new fields were introduced.
+        # metadata.create_all only creates new tables; it does not ALTER existing ones.
+        await connection.execute(
+            sql_text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS template_id VARCHAR(32) REFERENCES templates(id) ON DELETE SET NULL")
+        )
+        await connection.execute(
+            sql_text("CREATE INDEX IF NOT EXISTS ix_projects_template_id ON projects (template_id)")
+        )

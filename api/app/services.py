@@ -1,8 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import string
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -20,75 +21,106 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ALLOWED_PROJECT_PREFIXES, MODEL_PRICING_PER_MILLION, settings
 from app.database import AsyncSessionLocal
-from app.models import Artifact, ChatMessage, NodeExecution, Project, Run, RunEvent, generate_id, utcnow
+from app.models import Artifact, ChatMessage, NodeExecution, Project, Run, RunEvent, Template, generate_id, utcnow
 
 logger = logging.getLogger("flowpro")
 
-WORKFLOW_NODES = [
-    {
-        "node_id": "intent_parser",
-        "node_name": "Intent Parser",
-        "node_type": "ai",
-        "model_profile": "fast_classifier",
-        "output_path": "working/intent.json",
-        "state_section": "working",
-        "state_key": "intent",
-    },
-    {
-        "node_id": "requirement_extractor",
-        "node_name": "Requirement Extractor",
-        "node_type": "ai",
-        "model_profile": "json_extractor",
-        "output_path": "working/requirements.json",
-        "state_section": "working",
-        "state_key": "requirements",
-    },
-    {
-        "node_id": "outline_builder",
-        "node_name": "Outline Builder",
-        "node_type": "ai",
-        "model_profile": "premium_writer",
-        "output_path": "working/outline.md",
-        "state_section": "working",
-        "state_key": "outline",
-    },
-    {
-        "node_id": "draft_writer",
-        "node_name": "Draft Writer",
-        "node_type": "ai",
-        "model_profile": "premium_writer",
-        "output_path": "working/draft.md",
-        "state_section": "working",
-        "state_key": "draft",
-    },
-    {
-        "node_id": "critic_qa",
-        "node_name": "Critic QA",
-        "node_type": "ai",
-        "model_profile": "deep_reasoner",
-        "output_path": "working/qa_report.json",
-        "state_section": "working",
-        "state_key": "qa_report",
-    },
-    {
-        "node_id": "final_writer",
-        "node_name": "Final Writer",
-        "node_type": "ai",
-        "model_profile": "premium_writer",
-        "output_path": "final/output.md",
-        "state_section": "final",
-        "state_key": "markdown",
-    },
-    {
-        "node_id": "pdf_generator",
-        "node_name": "PDF Generator",
-        "node_type": "utility",
-        "model_profile": None,
-        "output_path": "final/output.pdf",
-        "state_section": "final",
-        "state_key": "pdf",
-    },
-]
+SUPPORTED_NODE_TYPES = {"ai", "plan", "pdf_generator"}
+SUPPORTED_OUTPUT_FORMATS = {"json", "markdown", "pdf"}
+SUPPORTED_VIEWERS = {"markdown", "pdf", "json", "raw"}
+
+
+def validate_template_config(config: dict[str, Any]) -> None:
+    """Validate a template config_json blob. Raises HTTPException with 400 on failure."""
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail="Template config must be an object.")
+
+    name = config.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise HTTPException(status_code=400, detail="Template config.name is required.")
+
+    nodes = config.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        raise HTTPException(status_code=400, detail="Template config.nodes must be a non-empty list.")
+
+    allowed_viewers = config.get("allowed_viewers", [])
+    if not isinstance(allowed_viewers, list):
+        raise HTTPException(status_code=400, detail="allowed_viewers must be a list of viewer names.")
+    for viewer in allowed_viewers:
+        if viewer not in SUPPORTED_VIEWERS:
+            raise HTTPException(status_code=400, detail=f"Unsupported viewer: {viewer}")
+
+    default_viewer = config.get("default_viewer")
+    if default_viewer is not None and default_viewer not in SUPPORTED_VIEWERS:
+        raise HTTPException(status_code=400, detail=f"Unsupported default_viewer: {default_viewer}")
+
+    seen_ids: set[str] = set()
+    produced: set[str] = set()  # "section.key" tokens produced so far
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            raise HTTPException(status_code=400, detail=f"Node #{index} must be an object.")
+
+        node_id = node.get("id")
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise HTTPException(status_code=400, detail=f"Node #{index} is missing id.")
+        if node_id in seen_ids:
+            raise HTTPException(status_code=400, detail=f"Duplicate node id: {node_id}")
+        seen_ids.add(node_id)
+
+        node_name = node.get("name")
+        if not isinstance(node_name, str) or not node_name.strip():
+            raise HTTPException(status_code=400, detail=f"Node {node_id} is missing name.")
+
+        node_type = node.get("type")
+        if node_type not in SUPPORTED_NODE_TYPES:
+            raise HTTPException(status_code=400, detail=f"Node {node_id} has unsupported type: {node_type}")
+
+        if node_type in ("ai", "plan"):
+            model_profile = node.get("model_profile")
+            if model_profile not in settings.model_profiles:
+                raise HTTPException(status_code=400, detail=f"Node {node_id} has unknown model_profile: {model_profile}")
+
+        output = node.get("output")
+        if not isinstance(output, dict):
+            raise HTTPException(status_code=400, detail=f"Node {node_id} is missing output.")
+        out_format = output.get("format")
+        if out_format not in SUPPORTED_OUTPUT_FORMATS:
+            raise HTTPException(status_code=400, detail=f"Node {node_id} output.format invalid: {out_format}")
+        out_path = output.get("path")
+        if not isinstance(out_path, str) or not out_path:
+            raise HTTPException(status_code=400, detail=f"Node {node_id} output.path is required.")
+        first_segment = out_path.split("/", 1)[0]
+        if first_segment not in ALLOWED_PROJECT_PREFIXES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Node {node_id} output.path must start with one of {sorted(ALLOWED_PROJECT_PREFIXES)}",
+            )
+        section = output.get("state_section")
+        key = output.get("state_key")
+        if not isinstance(section, str) or not section or not isinstance(key, str) or not key:
+            raise HTTPException(status_code=400, detail=f"Node {node_id} output.state_section and state_key are required.")
+
+        reads = node.get("reads", [])
+        if not isinstance(reads, list):
+            raise HTTPException(status_code=400, detail=f"Node {node_id} reads must be a list.")
+        for ref in reads:
+            if not isinstance(ref, str) or "." not in ref:
+                raise HTTPException(status_code=400, detail=f"Node {node_id} read '{ref}' must be in 'section.key' form.")
+            if ref not in produced:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Node {node_id} reads '{ref}' but no upstream node has produced it.",
+                )
+
+        produced.add(f"{section}.{key}")
+
+        if node_type == "pdf_generator":
+            # PDF generator must have at least one read for its markdown source
+            if not reads:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Node {node_id} (pdf_generator) must declare at least one read pointing to a markdown source.",
+                )
 
 
 class AuthService:
@@ -532,7 +564,26 @@ class WorkflowService:
         await redis.rpush("flowpro:runs", run_id)
         await redis.close()
 
+    async def resolve_template_for_project(self, db: AsyncSession, project: Project) -> Template | None:
+        if project.template_id:
+            template = await db.get(Template, project.template_id)
+            if template:
+                return template
+        # Fall back to the seeded document_generator template by slug.
+        result = await db.execute(select(Template).where(Template.slug == "document_generator"))
+        return result.scalar_one_or_none()
+
     async def create_run(self, db: AsyncSession, project: Project, message: str) -> Run:
+        template = await self.resolve_template_for_project(db, project)
+        if not template:
+            raise HTTPException(
+                status_code=400,
+                detail="No template available for this project. Seed templates and assign one to the project.",
+            )
+        nodes_config = (template.config_json or {}).get("nodes", [])
+        if not isinstance(nodes_config, list) or not nodes_config:
+            raise HTTPException(status_code=400, detail="Template has no nodes.")
+
         uploaded_files = await self.storage.list_files(db, project.id, "input")
         run = Run(
             id=generate_id("run"),
@@ -546,6 +597,9 @@ class WorkflowService:
                         {"artifact_id": item.id, "path": item.path, "filename": item.filename}
                         for item in uploaded_files
                     ],
+                    "template_id": template.id,
+                    "template_slug": template.slug,
+                    "template_name": template.name,
                 },
                 "working": {},
                 "final": {},
@@ -561,16 +615,16 @@ class WorkflowService:
                 content=message,
             )
         )
-        for node in WORKFLOW_NODES:
+        for node in nodes_config:
             db.add(
                 NodeExecution(
                     id=generate_id("nex"),
                     run_id=run.id,
-                    node_id=node["node_id"],
-                    node_name=node["node_name"],
-                    node_type=node["node_type"],
+                    node_id=node["id"],
+                    node_name=node["name"],
+                    node_type=node["type"],
                     status="waiting",
-                    model_profile=node["model_profile"],
+                    model_profile=node.get("model_profile"),
                     input_json={},
                     output_json={},
                 )
@@ -616,135 +670,61 @@ class WorkflowService:
             {"run_id": run_id, "node_id": node_id, "artifact_id": artifact.id, "path": artifact.path},
         )
 
-    def _mock_ai_result(self, node: dict[str, Any], input_json: dict[str, Any]) -> dict[str, Any]:
-        user_message = str(input_json.get("user_message") or input_json.get("message") or "Create a professional document.")
-        uploaded_files = input_json.get("uploaded_files") or []
-        if node["node_id"] == "intent_parser":
-            content: Any = {
-                "document_type": "Proposal",
-                "target_audience": "Internal stakeholders",
-                "goal": user_message[:160],
-                "tone": "Professional",
-                "requested_outputs": ["markdown", "pdf"],
-                "missing_information": [],
-            }
-        elif node["node_id"] == "requirement_extractor":
-            content = {
-                "requirements": [
-                    "Produce a complete document in Markdown.",
-                    "Keep the structure clear and ready for PDF export.",
-                ],
-                "constraints": [
-                    "Stay aligned with the user's request.",
-                    "Use only project-scoped files and generated artifacts.",
-                ],
-                "must_include": [
-                    "Executive summary",
-                    "Key deliverables",
-                    "Next steps",
-                ],
-                "must_avoid": [
-                    "Unsupported claims",
-                    "Placeholder TODO content",
-                ],
-                "source_notes": [
-                    f"User message: {user_message}",
-                    f"Uploaded file count: {len(uploaded_files)}",
-                ],
-            }
-        elif node["node_id"] == "outline_builder":
-            content = "\n".join(
-                [
-                    "# Document Outline",
-                    "",
-                    "## Executive Summary",
-                    "## Background",
-                    "## Proposed Approach",
-                    "## Deliverables",
-                    "## Risks and Mitigations",
-                    "## Next Steps",
-                ]
-            )
-        elif node["node_id"] == "draft_writer":
-            content = "\n".join(
-                [
-                    "# Draft Document",
-                    "",
-                    "## Executive Summary",
-                    f"This draft responds to the request: {user_message}",
-                    "",
-                    "## Background",
-                    "The project is being prepared inside FlowPro with stable infrastructure primitives.",
-                    "",
-                    "## Proposed Approach",
-                    "The workflow converts the request into requirements, a document outline, a draft, and a final deliverable.",
-                    "",
-                    "## Deliverables",
-                    "- Markdown output",
-                    "- PDF output",
-                    "- Inspectable run history and artifacts",
-                    "",
-                    "## Risks and Mitigations",
-                    "- Validate storage paths to keep all writes within the project root.",
-                    "- Use mock mode to test infrastructure without external model dependency.",
-                    "",
-                    "## Next Steps",
-                    "Review, approve, and continue with the final revision.",
-                ]
-            )
-        elif node["node_id"] == "critic_qa":
-            content = {
-                "overall_score": 93,
-                "issues": [
-                    "The draft can be tightened for clarity.",
-                ],
-                "recommended_fixes": [
-                    "Shorten repetitive phrasing.",
-                    "Ensure the summary and next steps are explicit.",
-                ],
-                "final_instruction": "Produce a concise, polished final document with explicit action items.",
-            }
-        elif node["node_id"] == "final_writer":
-            request_line = user_message.rstrip(".")
-            content = "\n".join(
-                [
-                    "# Proposal: Internal AI Document Cockpit",
-                    "",
-                    "## Executive Summary",
-                    f"This proposal addresses the request: {request_line}.",
-                    "It recommends a focused Phase 1 implementation that delivers a stable internal workflow from request to Markdown and PDF output.",
-                    "",
-                    "## Problem",
-                    "Teams need a predictable way to turn a brief request into a reviewable document package.",
-                    "Current ad-hoc drafting is slow, hard to audit, and difficult to repeat.",
-                    "",
-                    "## Proposed Solution",
-                    "- Capture request context in a project workspace.",
-                    "- Execute a fixed seven-node generation workflow with live run visibility.",
-                    "- Store intermediate and final artifacts in project-scoped R2 paths.",
-                    "- Provide markdown and PDF outputs for immediate review and download.",
-                    "",
-                    "## Deliverables in Phase 1",
-                    "- Intent, requirements, outline, draft, QA report, final markdown, and final PDF artifacts.",
-                    "- Live node status, run events, and state inspector.",
-                    "- File browser actions: upload, preview, download, delete.",
-                    "",
-                    "## Success Criteria",
-                    "- A user can submit a request and track node execution in real time.",
-                    "- Final markdown and PDF are generated and accessible in one run.",
-                    "- The run remains inspectable for auditing and troubleshooting.",
-                    "",
-                    "## Next Steps",
-                    "Approve this implementation baseline, run team trials with MOCK_AI mode, then enable production model profiles after workflow sign-off.",
-                ]
-            )
-        else:
-            raise RuntimeError(f"Unsupported mock node: {node['node_id']}")
+    def _build_substitution_context(
+        self,
+        message: str,
+        uploaded_files: list[Artifact],
+        run_context: dict[str, str],
+    ) -> dict[str, str]:
+        ctx: dict[str, str] = {
+            "message": message,
+            "message_short": message[:160],
+            "message_no_period": message.rstrip("."),
+            "uploaded_files": json.dumps(
+                [{"path": item.path, "filename": item.filename} for item in uploaded_files],
+                indent=2,
+            ),
+        }
+        for ref, rendered in run_context.items():
+            # "working.intent" -> "working_intent" so it can be used as ${working_intent}
+            ctx[ref.replace(".", "_")] = rendered
+        return ctx
 
+    def _apply_substitutions(self, value: Any, context: dict[str, str]) -> Any:
+        if isinstance(value, str):
+            return string.Template(value).safe_substitute(context)
+        if isinstance(value, dict):
+            return {key: self._apply_substitutions(item, context) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._apply_substitutions(item, context) for item in value]
+        return value
+
+    def _mock_node_result(
+        self,
+        node_config: dict[str, Any],
+        sub_context: dict[str, str],
+    ) -> dict[str, Any]:
+        output_format = node_config["output"]["format"]
+        mock = node_config.get("mock_content")
+        if mock is None:
+            if output_format == "json":
+                content: Any = {
+                    "node_id": node_config["id"],
+                    "summary": f"Mock output for {node_config['name']}.",
+                    "input_message_preview": sub_context.get("message_short", ""),
+                }
+            else:
+                content = (
+                    f"# {node_config['name']}\n\n"
+                    "This is a deterministic mock output generated because MOCK_AI=true.\n\n"
+                    f"Request preview: {sub_context.get('message_short', '')}"
+                )
+        else:
+            content = self._apply_substitutions(mock, sub_context)
         return {
             "content": content if isinstance(content, str) else json.dumps(content, indent=2),
-            "parsed": content if isinstance(content, dict) else None,
-            "model_used": f"mock/{node['node_id']}",
+            "parsed": content if isinstance(content, (dict, list)) else None,
+            "model_used": f"mock/{node_config['id']}",
             "token_input": 0,
             "token_output": 0,
             "cost_estimate": 0.0,
@@ -755,49 +735,82 @@ class WorkflowService:
         db: AsyncSession,
         project: Project,
         run: Run,
-        node: dict[str, Any],
-        input_json: dict[str, Any],
-        system_prompt: str,
-        user_prompt: str,
+        node_config: dict[str, Any],
+        message: str,
+        uploaded_files: list[Artifact],
         state: dict[str, Any],
-        expect_json: bool,
-    ) -> Any:
-        node_row = await self._load_node(db, run.id, node["node_id"])
+        run_context: dict[str, str],
+    ) -> None:
+        node_row = await self._load_node(db, run.id, node_config["id"])
         node_row.status = "running"
         node_row.started_at = utcnow()
-        node_row.input_json = input_json
-        await self.emit_event(db, run.id, "node.started", {"run_id": run.id, "node_id": node["node_id"]})
+
+        sub_context = self._build_substitution_context(message, uploaded_files, run_context)
+        system_prompt = node_config.get("system_prompt", "") or ""
+        user_prompt_template = node_config.get("user_prompt_template", "") or ""
+        user_prompt = string.Template(user_prompt_template).safe_substitute(sub_context)
+
+        output_format = node_config["output"]["format"]
+        expect_json = output_format == "json"
+
+        node_row.input_json = {
+            "message": message,
+            "reads": node_config.get("reads", []),
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "model_profile": node_config.get("model_profile"),
+        }
+        await self.emit_event(db, run.id, "node.started", {"run_id": run.id, "node_id": node_config["id"]})
         await db.commit()
+
         try:
-            result = self._mock_ai_result(node, input_json) if settings.mock_ai else (
-                await self.openrouter.run_json_completion(
-                    model_profile=node["model_profile"],
+            if settings.mock_ai:
+                result = self._mock_node_result(node_config, sub_context)
+            elif expect_json:
+                result = await self.openrouter.run_json_completion(
+                    model_profile=node_config["model_profile"],
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                 )
-                if expect_json
-                else await self.openrouter.run_chat_completion(
-                    model_profile=node["model_profile"],
+            else:
+                result = await self.openrouter.run_chat_completion(
+                    model_profile=node_config["model_profile"],
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                 )
-            )
-            content = result["parsed"] if expect_json else result["content"]
-            mime_type = "application/json" if expect_json else "text/markdown"
-            payload = json.dumps(content, indent=2) if expect_json else content
+
+            if expect_json:
+                parsed = result.get("parsed")
+                if parsed is None:
+                    parsed = json.loads(result["content"])
+                content: Any = parsed
+                payload_text = json.dumps(content, indent=2)
+                mime_type = "application/json"
+            else:
+                content = result["content"]
+                payload_text = content
+                mime_type = "text/markdown"
+
             artifact = await self.storage.write_file(
                 db,
                 project,
-                node["output_path"],
-                payload,
+                node_config["output"]["path"],
+                payload_text,
                 mime_type,
                 "node",
                 run.id,
-                node["node_id"],
+                node_config["id"],
             )
-            state[node["state_section"]][node["state_key"]] = artifact.id
+
+            section = node_config["output"]["state_section"]
+            key = node_config["output"]["state_key"]
+            state.setdefault(section, {})
+            state[section][key] = artifact.id
             run.state_json = state
             run.updated_at = utcnow()
+
+            run_context[f"{section}.{key}"] = payload_text
+
             node_row.status = "completed"
             node_row.model_used = result["model_used"]
             node_row.token_input = result["token_input"]
@@ -809,71 +822,105 @@ class WorkflowService:
                 "data": content,
             }
             node_row.completed_at = utcnow()
-            await self._artifact_event(db, run.id, node["node_id"], artifact)
+            await self._artifact_event(db, run.id, node_config["id"], artifact)
             await self.emit_event(
                 db,
                 run.id,
                 "node.completed",
-                {"run_id": run.id, "node_id": node["node_id"], "artifact_id": artifact.id},
+                {"run_id": run.id, "node_id": node_config["id"], "artifact_id": artifact.id},
             )
             await db.commit()
-            return content
         except Exception as error:
             await self._mark_failure(db, run, node_row, error)
             raise
+
+    async def _resolve_markdown_for_pdf(
+        self,
+        db: AsyncSession,
+        project: Project,
+        node_config: dict[str, Any],
+        state: dict[str, Any],
+        run_context: dict[str, str],
+    ) -> tuple[str, str | None]:
+        for ref in node_config.get("reads", []):
+            text = run_context.get(ref)
+            if text:
+                return text, ref
+        # Fallback: try to read the artifact directly from R2 using state references.
+        for ref in node_config.get("reads", []):
+            try:
+                section, key = ref.split(".", 1)
+            except ValueError:
+                continue
+            artifact_id = state.get(section, {}).get(key)
+            if not artifact_id:
+                continue
+            artifact = await db.get(Artifact, artifact_id)
+            if not artifact:
+                continue
+            raw = await self.storage.read_file(project, artifact.path)
+            return raw.decode("utf-8"), ref
+        return "", None
 
     async def _run_pdf_node(
         self,
         db: AsyncSession,
         project: Project,
         run: Run,
-        node: dict[str, Any],
-        markdown_text: str,
+        node_config: dict[str, Any],
         state: dict[str, Any],
+        run_context: dict[str, str],
     ) -> None:
-        node_row = await self._load_node(db, run.id, node["node_id"])
+        node_row = await self._load_node(db, run.id, node_config["id"])
         node_row.status = "running"
         node_row.started_at = utcnow()
-        node_row.input_json = {"path": "final/output.md", "markdown_length": len(markdown_text)}
-        await self.emit_event(db, run.id, "node.started", {"run_id": run.id, "node_id": node["node_id"]})
+
+        markdown_text, source_ref = await self._resolve_markdown_for_pdf(db, project, node_config, state, run_context)
+        node_row.input_json = {
+            "source": source_ref or "(none)",
+            "markdown_length": len(markdown_text),
+        }
+        await self.emit_event(db, run.id, "node.started", {"run_id": run.id, "node_id": node_config["id"]})
         await db.commit()
+
         try:
+            if not markdown_text:
+                raise RuntimeError(
+                    "PDF generator has no markdown source. Ensure a markdown-producing node runs before this node and that this node declares it in 'reads'."
+                )
             html = self.pdf_service.markdown_to_html(markdown_text)
             pdf_bytes = await self.pdf_service.html_to_pdf(html)
             artifact = await self.storage.write_file(
                 db,
                 project,
-                node["output_path"],
+                node_config["output"]["path"],
                 pdf_bytes,
                 "application/pdf",
                 "node",
                 run.id,
-                node["node_id"],
+                node_config["id"],
             )
-            state[node["state_section"]][node["state_key"]] = artifact.id
+
+            section = node_config["output"]["state_section"]
+            key = node_config["output"]["state_key"]
+            state.setdefault(section, {})
+            state[section][key] = artifact.id
             run.state_json = state
-            run.status = "completed"
             run.updated_at = utcnow()
-            run.completed_at = utcnow()
+
             node_row.status = "completed"
-            node_row.output_json = {"artifact_id": artifact.id, "path": artifact.path, "html_length": len(html)}
+            node_row.output_json = {
+                "artifact_id": artifact.id,
+                "path": artifact.path,
+                "html_length": len(html),
+            }
             node_row.completed_at = utcnow()
-            await self._artifact_event(db, run.id, node["node_id"], artifact)
+            await self._artifact_event(db, run.id, node_config["id"], artifact)
             await self.emit_event(
                 db,
                 run.id,
                 "node.completed",
-                {"run_id": run.id, "node_id": node["node_id"], "artifact_id": artifact.id},
-            )
-            await self.emit_event(db, run.id, "run.completed", {"run_id": run.id})
-            db.add(
-                ChatMessage(
-                    id=generate_id("msg"),
-                    project_id=project.id,
-                    run_id=run.id,
-                    role="assistant",
-                    content="Document generated. Markdown and PDF are ready.",
-                )
+                {"run_id": run.id, "node_id": node_config["id"], "artifact_id": artifact.id},
             )
             await db.commit()
         except Exception as error:
@@ -889,109 +936,89 @@ class WorkflowService:
             if not project:
                 return
 
+            template = await self.resolve_template_for_project(db, project)
+            if not template:
+                run.status = "failed"
+                run.error_message = "No template available for project."
+                run.updated_at = utcnow()
+                run.completed_at = utcnow()
+                await self.emit_event(db, run.id, "run.failed", {"run_id": run.id, "error": run.error_message})
+                await db.commit()
+                return
+
+            nodes_config = (template.config_json or {}).get("nodes", [])
+            if not isinstance(nodes_config, list) or not nodes_config:
+                run.status = "failed"
+                run.error_message = "Template has no nodes."
+                run.updated_at = utcnow()
+                run.completed_at = utcnow()
+                await self.emit_event(db, run.id, "run.failed", {"run_id": run.id, "error": run.error_message})
+                await db.commit()
+                return
+
             run.status = "running"
             run.updated_at = utcnow()
-            await self.emit_event(db, run.id, "run.started", {"run_id": run.id})
+            await self.emit_event(
+                db,
+                run.id,
+                "run.started",
+                {"run_id": run.id, "template_id": template.id, "template_slug": template.slug},
+            )
             await db.commit()
 
             uploaded_files = await self.storage.list_files(db, project.id, "input")
-            state = run.state_json or {"input": {}, "working": {}, "final": {}}
-            context: dict[str, Any] = {
-                "message": run.input_message,
-                "uploaded_files": [{"filename": item.filename, "path": item.path, "artifact_id": item.id} for item in uploaded_files],
-            }
+            state: dict[str, Any] = run.state_json or {"input": {}, "working": {}, "final": {}}
+            for section in ("input", "working", "final", "logs", "archive"):
+                state.setdefault(section, {})
+            run_context: dict[str, str] = {}
 
             try:
-                context["intent"] = await self._run_ai_node(
-                    db,
-                    project,
-                    run,
-                    WORKFLOW_NODES[0],
-                    {"user_message": context["message"], "uploaded_files": context["uploaded_files"]},
-                    "Extract the user's document-generation intent into the required JSON shape. Always return the requested keys.",
-                    f"User message:\n{context['message']}\n\nUploaded files:\n{json.dumps(context['uploaded_files'], indent=2)}\n\nReturn JSON with keys: document_type, target_audience, goal, tone, requested_outputs, missing_information.",
-                    state,
-                    True,
+                for node_config in nodes_config:
+                    node_type = node_config.get("type", "ai")
+                    if node_type in ("ai", "plan"):
+                        await self._run_ai_node(
+                            db,
+                            project,
+                            run,
+                            node_config,
+                            run.input_message,
+                            uploaded_files,
+                            state,
+                            run_context,
+                        )
+                    elif node_type == "pdf_generator":
+                        await self._run_pdf_node(db, project, run, node_config, state, run_context)
+                    else:
+                        raise RuntimeError(f"Unsupported node type: {node_type}")
+
+                run.status = "completed"
+                run.completed_at = utcnow()
+                run.updated_at = utcnow()
+                await self.emit_event(db, run.id, "run.completed", {"run_id": run.id})
+                produced_pdf = any(node.get("type") == "pdf_generator" for node in nodes_config)
+                produced_markdown = any(
+                    node.get("output", {}).get("format") == "markdown" for node in nodes_config
                 )
-                context["requirements"] = await self._run_ai_node(
-                    db,
-                    project,
-                    run,
-                    WORKFLOW_NODES[1],
-                    {
-                        "user_message": context["message"],
-                        "uploaded_files": context["uploaded_files"],
-                        "intent": context["intent"],
-                    },
-                    "Extract concrete requirements, constraints, must_include, must_avoid, and source_notes. Return only valid JSON.",
-                    f"User message:\n{context['message']}\n\nUploaded files:\n{json.dumps(context['uploaded_files'], indent=2)}\n\nIntent JSON:\n{json.dumps(context['intent'], indent=2)}",
-                    state,
-                    True,
+                if produced_pdf and produced_markdown:
+                    completion_msg = "Document generated. Markdown and PDF are ready."
+                elif produced_pdf:
+                    completion_msg = "PDF output is ready."
+                elif produced_markdown:
+                    completion_msg = "Markdown output is ready."
+                else:
+                    completion_msg = "Run complete. Outputs available in the Files tab."
+                db.add(
+                    ChatMessage(
+                        id=generate_id("msg"),
+                        project_id=project.id,
+                        run_id=run.id,
+                        role="assistant",
+                        content=completion_msg,
+                    )
                 )
-                context["outline"] = await self._run_ai_node(
-                    db,
-                    project,
-                    run,
-                    WORKFLOW_NODES[2],
-                    {
-                        "user_message": context["message"],
-                        "intent": context["intent"],
-                        "requirements": context["requirements"],
-                    },
-                    "Write a strong markdown outline for the requested document. Use structure, headings, and bullets. Do not write the full document.",
-                    f"User message:\n{context['message']}\n\nIntent JSON:\n{json.dumps(context['intent'], indent=2)}\n\nRequirements JSON:\n{json.dumps(context['requirements'], indent=2)}",
-                    state,
-                    False,
-                )
-                context["draft"] = await self._run_ai_node(
-                    db,
-                    project,
-                    run,
-                    WORKFLOW_NODES[3],
-                    {
-                        "user_message": context["message"],
-                        "intent": context["intent"],
-                        "requirements": context["requirements"],
-                        "outline": context["outline"],
-                    },
-                    "Write the complete markdown draft using the outline and every extracted requirement.",
-                    f"User message:\n{context['message']}\n\nIntent JSON:\n{json.dumps(context['intent'], indent=2)}\n\nRequirements JSON:\n{json.dumps(context['requirements'], indent=2)}\n\nOutline Markdown:\n{context['outline']}",
-                    state,
-                    False,
-                )
-                context["qa_report"] = await self._run_ai_node(
-                    db,
-                    project,
-                    run,
-                    WORKFLOW_NODES[4],
-                    {
-                        "user_message": context["message"],
-                        "requirements": context["requirements"],
-                        "draft": context["draft"],
-                    },
-                    "Audit the draft against the requirements. Return JSON with overall_score, issues, recommended_fixes, and final_instruction.",
-                    f"User message:\n{context['message']}\n\nRequirements JSON:\n{json.dumps(context['requirements'], indent=2)}\n\nDraft Markdown:\n{context['draft']}",
-                    state,
-                    True,
-                )
-                context["final_markdown"] = await self._run_ai_node(
-                    db,
-                    project,
-                    run,
-                    WORKFLOW_NODES[5],
-                    {
-                        "user_message": context["message"],
-                        "requirements": context["requirements"],
-                        "draft": context["draft"],
-                        "qa_report": context["qa_report"],
-                    },
-                    "Revise the draft into the final markdown document. Apply the QA recommendations and final instruction. Produce only markdown.",
-                    f"User message:\n{context['message']}\n\nRequirements JSON:\n{json.dumps(context['requirements'], indent=2)}\n\nDraft Markdown:\n{context['draft']}\n\nQA Report JSON:\n{json.dumps(context['qa_report'], indent=2)}",
-                    state,
-                    False,
-                )
-                await self._run_pdf_node(db, project, run, WORKFLOW_NODES[6], context["final_markdown"], state)
+                await db.commit()
             except Exception:
+                # _mark_failure already handled status/events/commit
                 return
 
 

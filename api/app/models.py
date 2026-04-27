@@ -38,9 +38,23 @@ class Project(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    template_id: Mapped[str | None] = mapped_column(ForeignKey("templates.id", ondelete="SET NULL"), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(Text, default="")
     r2_root_prefix: Mapped[str] = mapped_column(String(255), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Template(Base):
+    __tablename__ = "templates"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text, default="")
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    is_seeded: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -125,11 +139,25 @@ def serialize_project(project: Project) -> dict[str, Any]:
     return {
         "id": project.id,
         "user_id": project.user_id,
+        "template_id": project.template_id,
         "name": project.name,
         "description": project.description,
         "r2_root_prefix": project.r2_root_prefix,
         "created_at": iso(project.created_at),
         "updated_at": iso(project.updated_at),
+    }
+
+
+def serialize_template(template: Template) -> dict[str, Any]:
+    return {
+        "id": template.id,
+        "slug": template.slug,
+        "name": template.name,
+        "description": template.description,
+        "config_json": template.config_json or {},
+        "is_seeded": template.is_seeded,
+        "created_at": iso(template.created_at),
+        "updated_at": iso(template.updated_at),
     }
 
 
