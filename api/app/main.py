@@ -347,7 +347,11 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> di
 
 @app.get("/auth/me")
 async def me(current_user: User = Depends(get_current_user)) -> dict:
-    return serialize_user(current_user)
+    return {
+        **serialize_user(current_user),
+        "mock_ai_enabled": bool(settings.mock_ai),
+        "openrouter_configured": bool(settings.openrouter_api_key),
+    }
 
 
 @app.get("/projects")

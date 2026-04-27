@@ -20,6 +20,7 @@ import {
   RunEvent,
   Template,
   TemplateNodeConfig,
+  User,
   ViewerKind,
   apiFetch,
 } from "@/lib/api";
@@ -122,6 +123,7 @@ export default function WorkspacePage() {
   const [error, setError] = useState<string | null>(null);
   const [explorerOpen, setExplorerOpen] = useState(false);
   const [explorerInitialTab, setExplorerInitialTab] = useState<"project" | "vault">("project");
+  const [me, setMe] = useState<User | null>(null);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -298,6 +300,9 @@ export default function WorkspacePage() {
     loadTemplates().catch((err) =>
       setError(err instanceof Error ? err.message : "Failed to load templates.")
     );
+    apiFetch<User>("/auth/me")
+      .then(setMe)
+      .catch(() => undefined);
     return () => {
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
@@ -619,9 +624,31 @@ export default function WorkspacePage() {
 
   const composerDisabled = !selectedProjectId || !messageInput.trim() || isStartingRun || isRunInProgress;
 
+  const showMockBanner = me?.mock_ai_enabled === true;
+  const showMissingKeyBanner =
+    me && me.mock_ai_enabled === false && me.openrouter_configured === false;
+
   return (
-    <main className="h-screen overflow-hidden bg-slate-50 text-slate-900">
-      <div className="grid h-full grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)_440px]">
+    <main className="flex h-screen flex-col overflow-hidden bg-slate-50 text-slate-900">
+      {showMockBanner ? (
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900">
+          <span>
+            <span className="font-semibold">⚠ Mock AI mode is on</span> — every node returns a
+            canned response without calling OpenRouter. Outputs are fake. To use real models, set
+            <span className="mx-1 rounded bg-white px-1 py-0.5 font-mono text-[11px] text-amber-800">MOCK_AI=false</span>
+            on the api and worker services and redeploy.
+          </span>
+        </div>
+      ) : null}
+      {showMissingKeyBanner ? (
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-900">
+          <span>
+            <span className="font-semibold">⚠ OPENROUTER_API_KEY is not set.</span> Real-mode runs
+            will fail until you add the key to the api and worker services.
+          </span>
+        </div>
+      ) : null}
+      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)_440px]">
         {/* LEFT SIDEBAR — navigation & history */}
         <aside className="flex h-full min-h-0 flex-col border-r border-slate-200 bg-white">
           <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">

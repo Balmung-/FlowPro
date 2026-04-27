@@ -7,6 +7,8 @@ export type User = {
   email: string;
   name: string;
   created_at: string;
+  mock_ai_enabled?: boolean;
+  openrouter_configured?: boolean;
 };
 
 export type Project = {
