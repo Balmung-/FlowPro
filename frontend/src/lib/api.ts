@@ -1,0 +1,107 @@
+import { getStoredToken } from "@/lib/auth";
+
+export const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+
+export type User = {
+  id: string;
+  email: string;
+  name: string;
+  created_at: string;
+};
+
+export type Project = {
+  id: string;
+  user_id: string;
+  name: string;
+  description: string;
+  r2_root_prefix: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ChatMessage = {
+  id: string;
+  project_id: string;
+  run_id: string | null;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+};
+
+export type Artifact = {
+  id: string;
+  project_id: string;
+  run_id: string | null;
+  node_id: string | null;
+  path: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  created_by: "user" | "node" | "system";
+  deleted_at: string | null;
+  created_at: string;
+};
+
+export type Run = {
+  id: string;
+  project_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  input_message: string;
+  state_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  error_message: string | null;
+};
+
+export type NodeExecution = {
+  id: string;
+  run_id: string;
+  node_id: string;
+  node_name: string;
+  node_type: string;
+  status: "waiting" | "running" | "completed" | "failed" | "skipped";
+  model_profile: string | null;
+  model_used: string | null;
+  input_json: Record<string, unknown>;
+  output_json: Record<string, unknown>;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  token_input: number | null;
+  token_output: number | null;
+  cost_estimate: number | null;
+};
+
+export type RunEvent = {
+  id: string;
+  run_id: string;
+  type: string;
+  event_json: Record<string, unknown>;
+  created_at: string;
+};
+
+export type RunDetail = Run & {
+  artifacts: Artifact[];
+  events: RunEvent[];
+  node_executions: NodeExecution[];
+};
+
+export async function apiFetch<T>(path: string, init?: RequestInit, tokenOverride?: string): Promise<T> {
+  const token = tokenOverride ?? getStoredToken();
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {})
+    },
+    cache: "no-store"
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(body || `Request failed: ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
+
