@@ -1,6 +1,6 @@
 import { getStoredToken } from "@/lib/auth";
 
-export const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+export const API_BASE = "/api/proxy";
 
 export type User = {
   id: string;
@@ -104,4 +104,3 @@ export async function apiFetch<T>(path: string, init?: RequestInit, tokenOverrid
   }
   return response.json() as Promise<T>;
 }
-
