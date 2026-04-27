@@ -100,6 +100,11 @@ export default function WorkspacePage() {
 
   const selectedProject = useMemo(() => projects.find((project) => project.id === selectedProjectId) ?? null, [projects, selectedProjectId]);
   const selectedRunSummary = useMemo(() => runs.find((run) => run.id === selectedRunId) ?? selectedRun ?? null, [runs, selectedRun, selectedRunId]);
+  const selectedRunActive = selectedRunSummary?.status === "queued" || selectedRunSummary?.status === "running";
+  const isRunInProgress = useMemo(
+    () => runs.some((run) => run.status === "queued" || run.status === "running"),
+    [runs]
+  );
 
   const filesByGroup = useMemo(() => {
     const grouped = { input: [] as Artifact[], working: [] as Artifact[], final: [] as Artifact[], logs: [] as Artifact[], archive: [] as Artifact[] };
@@ -410,7 +415,7 @@ export default function WorkspacePage() {
             <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <input className="hidden" multiple ref={uploadRef} type="file" onChange={handleUpload} />
               <button className="rounded-2xl border border-slate-300 px-4 py-3 text-sm font-semibold text-slate-800 hover:bg-slate-50" onClick={() => uploadRef.current?.click()} disabled={!selectedProjectId || isUploadingFiles}>{isUploadingFiles ? "Uploading files..." : "Upload file"}</button>
-              <button className="rounded-2xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-blue-600/20 disabled:opacity-60" onClick={handleRunWorkflow} disabled={!selectedProjectId || !messageInput.trim() || isStartingRun}>{isStartingRun ? "Starting run..." : "Run workflow"}</button>
+              <button className="rounded-2xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-blue-600/20 disabled:opacity-60" onClick={handleRunWorkflow} disabled={!selectedProjectId || !messageInput.trim() || isStartingRun || isRunInProgress}>{isStartingRun ? "Starting run..." : isRunInProgress ? "Run in progress..." : "Run workflow"}</button>
             </div>
           </div>
 
@@ -432,7 +437,7 @@ export default function WorkspacePage() {
                     {runs.map((run) => (<option key={run.id} value={run.id}>{run.id} · {run.status}</option>))}
                   </select>
                   <span className={clsx("rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em]", statusTone(selectedRunSummary?.status ?? "waiting"))}>{selectedRunSummary?.status ?? "idle"}</span>
-                  <button className="rounded-2xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-blue-600/20 disabled:opacity-60" onClick={handleRunWorkflow} disabled={!selectedProjectId || !messageInput.trim() || isStartingRun}>{isStartingRun ? "Starting run..." : "Run"}</button>
+                  <button className="rounded-2xl border border-slate-300 bg-white px-5 py-3 text-sm font-semibold text-slate-800 disabled:opacity-60" onClick={handleRunWorkflow} disabled={!selectedProjectId || !messageInput.trim() || isStartingRun || isRunInProgress}>{isStartingRun ? "Starting run..." : isRunInProgress ? "Run in progress..." : "Run"}</button>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {TAB_KEYS.map((tab) => (<button key={tab} className={clsx("rounded-2xl px-4 py-2.5 text-sm font-semibold", activeTab === tab ? "bg-slate-950 text-white" : "border border-slate-300 bg-white text-slate-700")} onClick={() => setActiveTab(tab)}>{tab === "flow" ? "Node Flow" : tab === "data" ? "Data Inspector" : tab === "output" ? "Output Viewer" : tab === "logs" ? "Logs" : "Files"}</button>))}
@@ -443,40 +448,48 @@ export default function WorkspacePage() {
 
           <div className="min-h-0 flex-1 px-5 py-5">
             {activeTab === "flow" ? (
-              <div className="grid h-full grid-cols-1 gap-5 2xl:grid-cols-[minmax(0,1fr)_380px]">
-                <div className="h-[calc(100vh-240px)] min-h-[620px] overflow-hidden rounded-[28px] border border-slate-200 bg-slate-50">
-                  <ReactFlow nodes={flowNodes} edges={flowEdges} fitView fitViewOptions={{ padding: 0.2 }} onNodeClick={(_, node) => setSelectedNodeId(node.id)} nodesDraggable={false} nodesConnectable={false} elementsSelectable proOptions={{ hideAttribution: true }}>
-                    <Background color="#cbd5e1" gap={28} />
-                    <Controls showInteractive={false} />
-                  </ReactFlow>
+              selectedRun ? (
+                <div className="grid h-full grid-cols-1 gap-5 2xl:grid-cols-[minmax(0,1fr)_380px]">
+                  <div className="h-[calc(100vh-240px)] min-h-[620px] overflow-hidden rounded-[28px] border border-slate-200 bg-slate-50">
+                    <ReactFlow nodes={flowNodes} edges={flowEdges} fitView fitViewOptions={{ padding: 0.2 }} onNodeClick={(_, node) => setSelectedNodeId(node.id)} nodesDraggable={false} nodesConnectable={false} elementsSelectable proOptions={{ hideAttribution: true }}>
+                      <Background color="#cbd5e1" gap={28} />
+                      <Controls showInteractive={false} />
+                    </ReactFlow>
+                  </div>
+
+                  <aside className="scrollbar-thin h-[calc(100vh-240px)] min-h-[620px] overflow-y-auto rounded-[28px] border border-slate-200 bg-white p-5">
+                    <div className="flex items-center justify-between gap-4">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Node details</p>
+                        <h3 className="mt-2 text-xl font-semibold text-slate-950">{selectedNode?.node_name ?? WORKFLOW_STEPS.find((step) => step.id === selectedNodeId)?.name}</h3>
+                      </div>
+                      <span className={clsx("rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]", statusTone(selectedNode?.status ?? "waiting"))}>{selectedNode?.status ?? "waiting"}</span>
+                    </div>
+
+                    <div className="mt-5 grid gap-4">
+                      <div className="grid grid-cols-2 gap-3 rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+                        <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Model used</p><p className="mt-1 break-words">{selectedNode?.model_used ?? selectedNode?.model_profile ?? "n/a"}</p></div>
+                        <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Cost estimate</p><p className="mt-1">{selectedNode?.cost_estimate != null ? `$${selectedNode.cost_estimate.toFixed(4)}` : "n/a"}</p></div>
+                        <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Token input</p><p className="mt-1">{selectedNode?.token_input ?? 0}</p></div>
+                        <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Token output</p><p className="mt-1">{selectedNode?.token_output ?? 0}</p></div>
+                        <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Started at</p><p className="mt-1">{formatDateTime(selectedNode?.started_at)}</p></div>
+                        <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Completed at</p><p className="mt-1">{formatDateTime(selectedNode?.completed_at)}</p></div>
+                      </div>
+
+                      {selectedNode?.error_message ? <div className="rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{selectedNode.error_message}</div> : null}
+
+                      <div className="rounded-3xl border border-slate-200 bg-white p-4"><h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-slate-500">Input JSON</h4><div className="mt-3 overflow-auto text-sm"><JsonView collapsed={1} src={selectedNode?.input_json ?? {}} /></div></div>
+                      <div className="rounded-3xl border border-slate-200 bg-white p-4"><h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-slate-500">Output JSON</h4><div className="mt-3 overflow-auto text-sm"><JsonView collapsed={1} src={selectedNode?.output_json ?? {}} /></div></div>
+                    </div>
+                  </aside>
                 </div>
-
-                <aside className="scrollbar-thin h-[calc(100vh-240px)] min-h-[620px] overflow-y-auto rounded-[28px] border border-slate-200 bg-white p-5">
-                  <div className="flex items-center justify-between gap-4">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Node details</p>
-                      <h3 className="mt-2 text-xl font-semibold text-slate-950">{selectedNode?.node_name ?? WORKFLOW_STEPS.find((step) => step.id === selectedNodeId)?.name}</h3>
-                    </div>
-                    <span className={clsx("rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]", statusTone(selectedNode?.status ?? "waiting"))}>{selectedNode?.status ?? "waiting"}</span>
-                  </div>
-
-                  <div className="mt-5 grid gap-4">
-                    <div className="grid grid-cols-2 gap-3 rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
-                      <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Model used</p><p className="mt-1 break-words">{selectedNode?.model_used ?? selectedNode?.model_profile ?? "n/a"}</p></div>
-                      <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Cost estimate</p><p className="mt-1">{selectedNode?.cost_estimate != null ? `$${selectedNode.cost_estimate.toFixed(4)}` : "n/a"}</p></div>
-                      <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Token input</p><p className="mt-1">{selectedNode?.token_input ?? 0}</p></div>
-                      <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Token output</p><p className="mt-1">{selectedNode?.token_output ?? 0}</p></div>
-                      <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Started at</p><p className="mt-1">{formatDateTime(selectedNode?.started_at)}</p></div>
-                      <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Completed at</p><p className="mt-1">{formatDateTime(selectedNode?.completed_at)}</p></div>
-                    </div>
-
-                    {selectedNode?.error_message ? <div className="rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{selectedNode.error_message}</div> : null}
-
-                    <div className="rounded-3xl border border-slate-200 bg-white p-4"><h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-slate-500">Input JSON</h4><div className="mt-3 overflow-auto text-sm"><JsonView collapsed={1} src={selectedNode?.input_json ?? {}} /></div></div>
-                    <div className="rounded-3xl border border-slate-200 bg-white p-4"><h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-slate-500">Output JSON</h4><div className="mt-3 overflow-auto text-sm"><JsonView collapsed={1} src={selectedNode?.output_json ?? {}} /></div></div>
-                  </div>
-                </aside>
-              </div>
+              ) : (
+                <div className="flex h-[calc(100vh-240px)] min-h-[620px] items-center justify-center rounded-[28px] border border-dashed border-slate-300 bg-slate-50 px-6 text-center text-sm text-slate-500">
+                  {selectedProject
+                    ? "No run yet. Type a document request in the chat composer and click Run."
+                    : "Select or create a project, then type a document request and click Run."}
+                </div>
+              )
             ) : null}
 
             {activeTab === "data" ? (selectedRun ? <div className="scrollbar-thin h-[calc(100vh-240px)] min-h-[620px] overflow-auto rounded-[28px] border border-slate-200 bg-white p-5"><JsonView collapsed={2} src={selectedRun.state_json ?? {}} /></div> : <div className="flex h-[calc(100vh-240px)] min-h-[620px] items-center justify-center rounded-[28px] border border-dashed border-slate-300 bg-slate-50 text-sm text-slate-500">Select a run to inspect its state_json.</div>) : null}
@@ -522,19 +535,39 @@ export default function WorkspacePage() {
             ) : null}
 
             {activeTab === "output" ? (
-              <div className="grid h-full grid-cols-1 gap-5 xl:grid-cols-[220px_minmax(0,1fr)]">
-                <aside className="rounded-[28px] border border-slate-200 bg-white p-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Output mode</p>
-                  <div className="mt-4 space-y-3">
-                    <button className={clsx("w-full rounded-2xl px-4 py-3 text-sm font-semibold", outputMode === "markdown" ? "bg-slate-950 text-white" : "border border-slate-300 text-slate-700")} onClick={() => setOutputMode("markdown")}>Markdown</button>
-                    <button className={clsx("w-full rounded-2xl px-4 py-3 text-sm font-semibold", outputMode === "pdf" ? "bg-slate-950 text-white" : "border border-slate-300 text-slate-700")} onClick={() => setOutputMode("pdf")}>PDF</button>
+              selectedRun ? (
+                <div className="grid h-full grid-cols-1 gap-5 xl:grid-cols-[220px_minmax(0,1fr)]">
+                  <aside className="rounded-[28px] border border-slate-200 bg-white p-4">
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Output mode</p>
+                    <div className="mt-4 space-y-3">
+                      <button className={clsx("w-full rounded-2xl px-4 py-3 text-sm font-semibold", outputMode === "markdown" ? "bg-slate-950 text-white" : "border border-slate-300 text-slate-700")} onClick={() => setOutputMode("markdown")}>Markdown</button>
+                      <button className={clsx("w-full rounded-2xl px-4 py-3 text-sm font-semibold", outputMode === "pdf" ? "bg-slate-950 text-white" : "border border-slate-300 text-slate-700")} onClick={() => setOutputMode("pdf")}>PDF</button>
+                    </div>
+                  </aside>
+                  <div className="scrollbar-thin h-[calc(100vh-240px)] min-h-[620px] overflow-y-auto rounded-[28px] border border-slate-200 bg-white p-5">
+                    {previewError ? <p className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{previewError}</p> : null}
+                    {outputMode === "markdown" ? (
+                      latestMarkdownArtifact ? (
+                        <article className="prose prose-slate max-w-none prose-headings:text-slate-950"><ReactMarkdown>{previewArtifactId === latestMarkdownArtifact.id ? previewText : ""}</ReactMarkdown></article>
+                      ) : (
+                        <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">
+                          {selectedRunActive ? "Output will appear when final files are created." : "No final markdown exists for the selected run."}
+                        </div>
+                      )
+                    ) : latestPdfArtifact ? (
+                      <iframe className="h-[calc(100vh-300px)] min-h-[560px] w-full rounded-2xl border border-slate-200 bg-white" src={previewArtifactId === latestPdfArtifact.id ? previewUrl : filePreviewPath(latestPdfArtifact.id)} />
+                    ) : (
+                      <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">
+                        {selectedRunActive ? "Output will appear when final files are created." : "No final PDF exists for the selected run."}
+                      </div>
+                    )}
                   </div>
-                </aside>
-                <div className="scrollbar-thin h-[calc(100vh-240px)] min-h-[620px] overflow-y-auto rounded-[28px] border border-slate-200 bg-white p-5">
-                  {previewError ? <p className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{previewError}</p> : null}
-                  {outputMode === "markdown" ? (latestMarkdownArtifact ? <article className="prose prose-slate max-w-none prose-headings:text-slate-950"><ReactMarkdown>{previewArtifactId === latestMarkdownArtifact.id ? previewText : ""}</ReactMarkdown></article> : <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">No final markdown exists for the selected run.</div>) : latestPdfArtifact ? <iframe className="h-[calc(100vh-300px)] min-h-[560px] w-full rounded-2xl border border-slate-200 bg-white" src={previewArtifactId === latestPdfArtifact.id ? previewUrl : filePreviewPath(latestPdfArtifact.id)} /> : <div className="rounded-3xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500">No final PDF exists for the selected run.</div>}
                 </div>
-              </div>
+              ) : (
+                <div className="flex h-[calc(100vh-240px)] min-h-[620px] items-center justify-center rounded-[28px] border border-dashed border-slate-300 bg-slate-50 px-6 text-center text-sm text-slate-500">
+                  No run selected. Start a run from the chat composer to view generated markdown and PDF output.
+                </div>
+              )
             ) : null}
 
             {activeTab === "logs" ? (

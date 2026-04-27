@@ -587,15 +587,25 @@ class WorkflowService:
         return result.scalar_one()
 
     async def _mark_failure(self, db: AsyncSession, run: Run, node: NodeExecution, error: Exception) -> None:
+        error_text = str(error)
         node.status = "failed"
-        node.error_message = str(error)
+        node.error_message = error_text
         node.completed_at = utcnow()
         run.status = "failed"
-        run.error_message = str(error)
+        run.error_message = error_text
         run.updated_at = utcnow()
         run.completed_at = utcnow()
-        await self.emit_event(db, run.id, "node.failed", {"run_id": run.id, "node_id": node.node_id, "error": str(error)})
-        await self.emit_event(db, run.id, "run.failed", {"run_id": run.id, "error": str(error)})
+        await self.emit_event(db, run.id, "node.failed", {"run_id": run.id, "node_id": node.node_id, "error": error_text})
+        await self.emit_event(db, run.id, "run.failed", {"run_id": run.id, "error": error_text})
+        db.add(
+            ChatMessage(
+                id=generate_id("msg"),
+                project_id=run.project_id,
+                run_id=run.id,
+                role="system",
+                content=f"Run failed at {node.node_name}: {error_text}",
+            )
+        )
         await db.commit()
 
     async def _artifact_event(self, db: AsyncSession, run_id: str, node_id: str, artifact: Artifact) -> None:
@@ -695,26 +705,37 @@ class WorkflowService:
                 "final_instruction": "Produce a concise, polished final document with explicit action items.",
             }
         elif node["node_id"] == "final_writer":
+            request_line = user_message.rstrip(".")
             content = "\n".join(
                 [
-                    "# Final Document",
+                    "# Proposal: Internal AI Document Cockpit",
                     "",
                     "## Executive Summary",
-                    f"This final document fulfills the request: {user_message}",
+                    f"This proposal addresses the request: {request_line}.",
+                    "It recommends a focused Phase 1 implementation that delivers a stable internal workflow from request to Markdown and PDF output.",
                     "",
-                    "## Background",
-                    "FlowPro executed the fixed Document Generator workflow and preserved all run artifacts for inspection.",
+                    "## Problem",
+                    "Teams need a predictable way to turn a brief request into a reviewable document package.",
+                    "Current ad-hoc drafting is slow, hard to audit, and difficult to repeat.",
                     "",
-                    "## Proposed Approach",
-                    "The app stores user files in project-scoped Cloudflare R2 paths, executes ordered workflow nodes, and streams live run state back to the UI.",
+                    "## Proposed Solution",
+                    "- Capture request context in a project workspace.",
+                    "- Execute a fixed seven-node generation workflow with live run visibility.",
+                    "- Store intermediate and final artifacts in project-scoped R2 paths.",
+                    "- Provide markdown and PDF outputs for immediate review and download.",
                     "",
-                    "## Deliverables",
-                    "- Final Markdown document",
-                    "- Generated PDF",
-                    "- File records, node executions, and run events",
+                    "## Deliverables in Phase 1",
+                    "- Intent, requirements, outline, draft, QA report, final markdown, and final PDF artifacts.",
+                    "- Live node status, run events, and state inspector.",
+                    "- File browser actions: upload, preview, download, delete.",
+                    "",
+                    "## Success Criteria",
+                    "- A user can submit a request and track node execution in real time.",
+                    "- Final markdown and PDF are generated and accessible in one run.",
+                    "- The run remains inspectable for auditing and troubleshooting.",
                     "",
                     "## Next Steps",
-                    "Review the generated files in the Output Viewer and Files tabs, then download or delete as needed.",
+                    "Approve this implementation baseline, run team trials with MOCK_AI mode, then enable production model profiles after workflow sign-off.",
                 ]
             )
         else:
@@ -845,6 +866,15 @@ class WorkflowService:
                 {"run_id": run.id, "node_id": node["node_id"], "artifact_id": artifact.id},
             )
             await self.emit_event(db, run.id, "run.completed", {"run_id": run.id})
+            db.add(
+                ChatMessage(
+                    id=generate_id("msg"),
+                    project_id=project.id,
+                    run_id=run.id,
+                    role="assistant",
+                    content="Document generated. Markdown and PDF are ready.",
+                )
+            )
             await db.commit()
         except Exception as error:
             await self._mark_failure(db, run, node_row, error)
@@ -960,16 +990,6 @@ class WorkflowService:
                     state,
                     False,
                 )
-                db.add(
-                    ChatMessage(
-                        id=generate_id("msg"),
-                        project_id=project.id,
-                        run_id=run.id,
-                        role="assistant",
-                        content=context["final_markdown"],
-                    )
-                )
-                await db.commit()
                 await self._run_pdf_node(db, project, run, WORKFLOW_NODES[6], context["final_markdown"], state)
             except Exception:
                 return
