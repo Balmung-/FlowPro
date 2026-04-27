@@ -43,3 +43,7 @@ async def init_db() -> None:
         await connection.execute(
             sql_text("CREATE INDEX IF NOT EXISTS ix_projects_template_id ON projects (template_id)")
         )
+        # stop_after_node_id added later — used to pause a run mid-pipeline for debugging.
+        await connection.execute(
+            sql_text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS stop_after_node_id VARCHAR(64)")
+        )

@@ -1160,6 +1160,40 @@ class WorkflowService:
             await self._mark_failure(db, run, node_row, error)
             raise
 
+    async def _hydrate_run_context_from_state(
+        self,
+        db: AsyncSession,
+        project: Project,
+        state: dict[str, Any],
+        nodes_config: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """For a resumed run, rebuild run_context (section.key -> rendered text)
+        by reading already-produced artifacts from R2. Only used when a run
+        resumes after a pause — fresh runs start with an empty context.
+        """
+        context: dict[str, str] = {}
+        for node_config in nodes_config:
+            section = node_config.get("output", {}).get("state_section")
+            key = node_config.get("output", {}).get("state_key")
+            if not section or not key:
+                continue
+            artifact_id = state.get(section, {}).get(key)
+            if not artifact_id:
+                continue
+            artifact = await db.get(Artifact, artifact_id)
+            if not artifact or artifact.deleted_at is not None:
+                continue
+            try:
+                raw = await self.storage.read_file(project, artifact.path)
+            except Exception:
+                continue
+            try:
+                context[f"{section}.{key}"] = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                # Binary outputs (e.g. PDFs) aren't useful as text context, skip.
+                continue
+        return context
+
     async def execute_run(self, run_id: str) -> None:
         async with AsyncSessionLocal() as db:
             run = await db.get(Run, run_id)
@@ -1203,11 +1237,19 @@ class WorkflowService:
             state: dict[str, Any] = run.state_json or {"input": {}, "working": {}, "final": {}}
             for section in ("input", "working", "final", "logs", "archive"):
                 state.setdefault(section, {})
-            run_context: dict[str, str] = {}
+
+            # Hydrate run_context for resumed runs so downstream nodes can read upstream outputs.
+            run_context: dict[str, str] = await self._hydrate_run_context_from_state(
+                db, project, state, nodes_config
+            )
 
             try:
                 for node_config in nodes_config:
                     node_type = node_config.get("type", "ai")
+                    # Skip already-completed nodes when resuming after a pause.
+                    existing = await self._load_node(db, run.id, node_config["id"])
+                    if existing.status == "completed":
+                        continue
                     if node_type in ("ai", "plan"):
                         await self._run_ai_node(
                             db,
@@ -1223,6 +1265,30 @@ class WorkflowService:
                         await self._run_pdf_node(db, project, run, node_config, state, run_context)
                     else:
                         raise RuntimeError(f"Unsupported node type: {node_type}")
+
+                    # Honor a stop point: pause after this node so the user can
+                    # inspect intermediate state and decide whether to continue.
+                    await db.refresh(run)
+                    if run.stop_after_node_id == node_config["id"]:
+                        run.status = "paused"
+                        run.updated_at = utcnow()
+                        await self.emit_event(
+                            db,
+                            run.id,
+                            "run.paused",
+                            {"run_id": run.id, "stopped_after": node_config["id"]},
+                        )
+                        db.add(
+                            ChatMessage(
+                                id=generate_id("msg"),
+                                project_id=project.id,
+                                run_id=run.id,
+                                role="system",
+                                content=f"Run paused after {node_config['name']}. Click Continue to resume.",
+                            )
+                        )
+                        await db.commit()
+                        return
 
                 run.status = "completed"
                 run.completed_at = utcnow()

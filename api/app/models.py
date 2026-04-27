@@ -82,6 +82,10 @@ class Run(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set to a node_id to instruct the worker to pause AFTER that node completes.
+    # Cleared by the continue endpoint, which re-queues the run to resume from
+    # the first non-completed node.
+    stop_after_node_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class NodeExecution(Base):
@@ -207,6 +211,7 @@ def serialize_run(run: Run) -> dict[str, Any]:
         "updated_at": iso(run.updated_at),
         "completed_at": iso(run.completed_at),
         "error_message": run.error_message,
+        "stop_after_node_id": run.stop_after_node_id,
     }
 
 

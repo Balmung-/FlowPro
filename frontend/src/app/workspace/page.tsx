@@ -1,13 +1,11 @@
 "use client";
 
 import "react18-json-view/src/style.css";
-import "reactflow/dist/style.css";
 
 import clsx from "clsx";
 import JsonView from "react18-json-view";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
-import ReactFlow, { Background, Controls, Edge, MarkerType, Node } from "reactflow";
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
@@ -201,88 +199,6 @@ export default function WorkspacePage() {
     () => templateNodes.find((node) => node.id === selectedNodeId) ?? null,
     [templateNodes, selectedNodeId]
   );
-
-  // Build flow nodes from template config, overlay live execution status.
-  const flowNodes: Node[] = useMemo(() => {
-    if (!selectedRun || templateNodes.length === 0) return [];
-    return templateNodes.map((tplNode, index) => {
-      const execution = nodeExecutions.get(tplNode.id);
-      const status = execution?.status ?? "waiting";
-      return {
-        id: tplNode.id,
-        position: { x: index * 320, y: index % 2 === 0 ? 40 : 200 },
-        draggable: false,
-        data: {
-          label: (
-            <div className="w-[260px]">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-base font-semibold text-slate-950">{tplNode.name}</p>
-                  <p className="mt-1 text-xs uppercase tracking-wider text-slate-500">{tplNode.type}</p>
-                </div>
-                <span
-                  className={clsx(
-                    "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
-                    statusTone(status)
-                  )}
-                >
-                  {status}
-                </span>
-              </div>
-              <dl className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-600">
-                <div>
-                  <dt className="uppercase tracking-wide text-slate-400">Model</dt>
-                  <dd className="mt-1 break-words text-slate-700">
-                    {execution?.model_used ?? tplNode.model_profile ?? "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="uppercase tracking-wide text-slate-400">Tokens</dt>
-                  <dd className="mt-1 text-slate-700">
-                    {(execution?.token_input ?? 0) + (execution?.token_output ?? 0)}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="uppercase tracking-wide text-slate-400">Cost</dt>
-                  <dd className="mt-1 text-slate-700">
-                    {execution?.cost_estimate != null ? `$${execution.cost_estimate.toFixed(4)}` : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="uppercase tracking-wide text-slate-400">Out</dt>
-                  <dd className="mt-1 truncate text-slate-700">{tplNode.output.format}</dd>
-                </div>
-              </dl>
-            </div>
-          ),
-        },
-        style: {
-          width: 286,
-          padding: 14,
-          borderRadius: 18,
-          border: tplNode.id === selectedNodeId ? "2px solid #0f172a" : "1px solid #cbd5e1",
-          background: "#ffffff",
-          boxShadow:
-            tplNode.id === selectedNodeId
-              ? "0 18px 45px rgba(15, 23, 42, 0.18)"
-              : "0 12px 28px rgba(15, 23, 42, 0.10)",
-        },
-      };
-    });
-  }, [templateNodes, nodeExecutions, selectedRun, selectedNodeId]);
-
-  const flowEdges: Edge[] = useMemo(() => {
-    if (!selectedRun || templateNodes.length < 2) return [];
-    return templateNodes.slice(0, -1).map((node, index) => ({
-      id: `${node.id}-${templateNodes[index + 1].id}`,
-      source: node.id,
-      target: templateNodes[index + 1].id,
-      type: "smoothstep",
-      animated: nodeExecutions.get(node.id)?.status === "running",
-      markerEnd: { type: MarkerType.ArrowClosed, color: "#94a3b8" },
-      style: { stroke: "#94a3b8", strokeWidth: 2 },
-    }));
-  }, [templateNodes, nodeExecutions, selectedRun]);
 
   const loadRunDetail = useCallback(async (runId: string) => {
     if (!runId) {
@@ -616,6 +532,58 @@ export default function WorkspacePage() {
       if (selectedProjectId) await loadProjectData(selectedProjectId, selectedRunId || undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : "Delete failed.");
+    }
+  }
+
+  async function handleSetStopPoint(nodeId: string) {
+    if (!selectedRunId) return;
+    setError(null);
+    try {
+      const updated = await apiFetch<Run>(`/runs/${selectedRunId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ stop_after_node_id: nodeId }),
+      });
+      // Refresh both the run summary and the detailed run state.
+      setSelectedRun((current) =>
+        current && current.id === updated.id ? { ...current, ...updated } : current
+      );
+      setRuns((current) =>
+        current.map((run) => (run.id === updated.id ? { ...run, ...updated } : run))
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to set stop point.");
+    }
+  }
+
+  async function handleClearStopPoint() {
+    if (!selectedRunId) return;
+    setError(null);
+    try {
+      const updated = await apiFetch<Run>(`/runs/${selectedRunId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ stop_after_node_id: null }),
+      });
+      setSelectedRun((current) =>
+        current && current.id === updated.id ? { ...current, ...updated } : current
+      );
+      setRuns((current) =>
+        current.map((run) => (run.id === updated.id ? { ...run, ...updated } : run))
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to clear stop point.");
+    }
+  }
+
+  async function handleContinueRun() {
+    if (!selectedRunId) return;
+    setError(null);
+    try {
+      await apiFetch<Run>(`/runs/${selectedRunId}/continue`, { method: "POST" });
+      if (selectedProjectId) {
+        await loadProjectData(selectedProjectId, selectedRunId);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to continue run.");
     }
   }
 
@@ -987,119 +955,278 @@ export default function WorkspacePage() {
             {/* NODE FLOW */}
             {activeTab === "flow" ? (
               selectedRun && templateNodes.length > 0 ? (
-                <div className="flex h-full min-h-[600px] flex-col gap-4">
-                  <div className="h-[280px] overflow-hidden rounded-2xl border border-slate-200 bg-slate-50">
-                    <ReactFlow
-                      nodes={flowNodes}
-                      edges={flowEdges}
-                      fitView
-                      fitViewOptions={{ padding: 0.15 }}
-                      onNodeClick={(_, node) => setSelectedNodeId(node.id)}
-                      nodesDraggable={false}
-                      nodesConnectable={false}
-                      elementsSelectable
-                      proOptions={{ hideAttribution: true }}
-                    >
-                      <Background color="#cbd5e1" gap={24} />
-                      <Controls showInteractive={false} />
-                    </ReactFlow>
-                  </div>
-
-                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">
-                          Node details
+                <div className="space-y-3">
+                  {/* Run header: status + continue/clear-stop controls */}
+                  <div className="rounded-xl border border-slate-200 bg-white p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                          Run · {selectedRun.id}
                         </p>
-                        <h3 className="mt-1 text-base font-semibold text-slate-900">
-                          {selectedNode?.node_name ?? selectedNodeConfig?.name ?? "Pick a node"}
-                        </h3>
+                        <p className="mt-0.5 truncate text-[11px] text-slate-500">
+                          {selectedRun.input_message}
+                        </p>
                       </div>
                       <span
                         className={clsx(
                           "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
-                          statusTone(selectedNode?.status ?? "waiting")
+                          statusTone(selectedRun.status)
                         )}
                       >
-                        {selectedNode?.status ?? "waiting"}
+                        {selectedRun.status}
                       </span>
                     </div>
-
-                    <dl className="mt-3 grid grid-cols-2 gap-3 text-xs text-slate-700">
-                      <div>
-                        <dt className="text-slate-500">Type</dt>
-                        <dd className="mt-0.5 text-slate-800">{selectedNodeConfig?.type ?? "—"}</dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-500">Model</dt>
-                        <dd className="mt-0.5 break-words text-slate-800">
-                          {selectedNode?.model_used ?? selectedNodeConfig?.model_profile ?? "—"}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-500">Cost</dt>
-                        <dd className="mt-0.5 text-slate-800">
-                          {selectedNode?.cost_estimate != null
-                            ? `$${selectedNode.cost_estimate.toFixed(4)}`
-                            : "—"}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-500">Tokens</dt>
-                        <dd className="mt-0.5 text-slate-800">
-                          in {selectedNode?.token_input ?? 0} · out {selectedNode?.token_output ?? 0}
-                        </dd>
-                      </div>
-                      <div className="col-span-2">
-                        <dt className="text-slate-500">Reads</dt>
-                        <dd className="mt-0.5 break-words font-mono text-[11px] text-slate-700">
-                          {selectedNodeConfig?.reads?.length
-                            ? selectedNodeConfig.reads.join(", ")
-                            : "(none)"}
-                        </dd>
-                      </div>
-                      <div className="col-span-2">
-                        <dt className="text-slate-500">Writes</dt>
-                        <dd className="mt-0.5 break-words font-mono text-[11px] text-slate-700">
-                          {selectedNodeConfig?.output?.path ?? "—"}
-                        </dd>
-                      </div>
-                    </dl>
-
-                    {selectedNode?.error_message ? (
-                      <div className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-                        {selectedNode.error_message}
+                    {selectedRun.status === "paused" || selectedRun.stop_after_node_id ? (
+                      <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs">
+                        <span className="font-semibold text-amber-900">
+                          {selectedRun.status === "paused"
+                            ? `Paused after ${
+                                templateNodes.find((n) => n.id === selectedRun.stop_after_node_id)
+                                  ?.name ?? "step"
+                              }`
+                            : `Will stop after ${
+                                templateNodes.find((n) => n.id === selectedRun.stop_after_node_id)
+                                  ?.name ?? "step"
+                              }`}
+                        </span>
+                        <span className="ml-auto flex gap-2">
+                          {selectedRun.status === "paused" ? (
+                            <button
+                              type="button"
+                              className="rounded-md bg-emerald-600 px-3 py-1 text-[11px] font-semibold text-white hover:bg-emerald-700"
+                              onClick={() => void handleContinueRun()}
+                            >
+                              ▶ Continue
+                            </button>
+                          ) : null}
+                          {selectedRun.stop_after_node_id ? (
+                            <button
+                              type="button"
+                              className="rounded-md border border-slate-300 bg-white px-3 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+                              onClick={() => void handleClearStopPoint()}
+                            >
+                              Clear stop
+                            </button>
+                          ) : null}
+                        </span>
                       </div>
                     ) : null}
-
-                    {selectedNodeConfig?.system_prompt ? (
-                      <details className="mt-3">
-                        <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wider text-slate-500">
-                          System prompt
-                        </summary>
-                        <pre className="mt-2 whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-[11px] leading-5 text-slate-700">
-                          {selectedNodeConfig.system_prompt}
-                        </pre>
-                      </details>
-                    ) : null}
-
-                    <details className="mt-2">
-                      <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wider text-slate-500">
-                        Input JSON
-                      </summary>
-                      <div className="mt-2 max-h-[180px] overflow-auto rounded-lg bg-slate-50 p-3">
-                        <JsonView collapsed={1} src={selectedNode?.input_json ?? {}} />
-                      </div>
-                    </details>
-                    <details className="mt-2">
-                      <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wider text-slate-500">
-                        Output JSON
-                      </summary>
-                      <div className="mt-2 max-h-[220px] overflow-auto rounded-lg bg-slate-50 p-3">
-                        <JsonView collapsed={1} src={selectedNode?.output_json ?? {}} />
-                      </div>
-                    </details>
                   </div>
+
+                  {/* Vertical stack of nodes */}
+                  {templateNodes.map((tplNode, index) => {
+                    const exec = nodeExecutions.get(tplNode.id);
+                    const status = exec?.status ?? "waiting";
+                    const isStopPoint = selectedRun.stop_after_node_id === tplNode.id;
+                    const isPausedHere =
+                      selectedRun.status === "paused" && isStopPoint;
+                    const isSelected = tplNode.id === selectedNodeId;
+                    const artifact =
+                      selectedRun.artifacts?.find(
+                        (a) =>
+                          a.deleted_at === null &&
+                          a.node_id === tplNode.id &&
+                          a.path === tplNode.output.path
+                      ) ?? null;
+                    const nextNode = templateNodes[index + 1];
+                    const modelDisplay =
+                      exec?.model_used ??
+                      tplNode.model ??
+                      tplNode.model_profile ??
+                      (tplNode.type === "pdf_generator" ? "no model" : "—");
+                    return (
+                      <div key={tplNode.id}>
+                        {/* Node card */}
+                        <button
+                          type="button"
+                          className={clsx(
+                            "block w-full rounded-xl border p-3 text-left transition",
+                            isSelected
+                              ? "border-slate-900 bg-white shadow-md"
+                              : "border-slate-200 bg-white hover:border-slate-300",
+                            isPausedHere && "ring-2 ring-amber-400",
+                            isStopPoint && !isPausedHere && "ring-1 ring-amber-300"
+                          )}
+                          onClick={() => setSelectedNodeId(tplNode.id)}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                Step {index + 1} · {tplNode.type}
+                              </p>
+                              <h3 className="mt-0.5 text-sm font-semibold text-slate-900">
+                                {tplNode.name}
+                              </h3>
+                            </div>
+                            <span
+                              className={clsx(
+                                "shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em]",
+                                statusTone(status)
+                              )}
+                            >
+                              {status}
+                            </span>
+                          </div>
+                          <dl className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
+                            <div>
+                              <dt className="text-slate-500">Model</dt>
+                              <dd className="mt-0.5 break-words text-slate-700">{modelDisplay}</dd>
+                            </div>
+                            <div>
+                              <dt className="text-slate-500">Tokens / Cost</dt>
+                              <dd className="mt-0.5 text-slate-700">
+                                {(exec?.token_input ?? 0) + (exec?.token_output ?? 0)} ·{" "}
+                                {exec?.cost_estimate != null
+                                  ? `$${exec.cost_estimate.toFixed(4)}`
+                                  : "—"}
+                              </dd>
+                            </div>
+                            {tplNode.reads?.length ? (
+                              <div className="col-span-2">
+                                <dt className="text-slate-500">Reads</dt>
+                                <dd className="mt-0.5 break-all font-mono text-[10px] text-slate-700">
+                                  {tplNode.reads.join(", ")}
+                                </dd>
+                              </div>
+                            ) : null}
+                          </dl>
+                          {exec?.error_message ? (
+                            <div className="mt-2 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-[11px] text-red-700">
+                              {exec.error_message}
+                            </div>
+                          ) : null}
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              className={clsx(
+                                "cursor-pointer rounded-md px-2 py-0.5 text-[10px] font-semibold transition",
+                                isStopPoint
+                                  ? "bg-amber-500 text-white hover:bg-amber-600"
+                                  : "border border-slate-200 bg-white text-slate-600 hover:bg-amber-50 hover:text-amber-800"
+                              )}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                if (isStopPoint) void handleClearStopPoint();
+                                else void handleSetStopPoint(tplNode.id);
+                              }}
+                              onKeyDown={(event) => {
+                                if (event.key !== "Enter" && event.key !== " ") return;
+                                event.preventDefault();
+                                event.stopPropagation();
+                                if (isStopPoint) void handleClearStopPoint();
+                                else void handleSetStopPoint(tplNode.id);
+                              }}
+                            >
+                              {isStopPoint ? "■ Stops here" : "⏸ Stop after"}
+                            </span>
+                          </div>
+                        </button>
+
+                        {/* File arrow between this node and the next */}
+                        {nextNode ? (
+                          <div className="my-1 ml-4 flex items-center gap-2 border-l-2 border-dashed border-slate-200 pl-3 py-2 text-[11px]">
+                            <span className="text-slate-400">↓</span>
+                            <span
+                              className={clsx(
+                                "rounded-md px-2 py-0.5 font-mono",
+                                artifact
+                                  ? "bg-emerald-50 text-emerald-800"
+                                  : "bg-slate-100 text-slate-500"
+                              )}
+                            >
+                              {tplNode.output.path}
+                            </span>
+                            {artifact ? (
+                              <span className="flex gap-1">
+                                <button
+                                  type="button"
+                                  className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-700 hover:bg-slate-50"
+                                  onClick={() =>
+                                    window.open(
+                                      filePreviewPath(artifact.id),
+                                      "_blank",
+                                      "noopener,noreferrer"
+                                    )
+                                  }
+                                >
+                                  view
+                                </button>
+                                <button
+                                  type="button"
+                                  className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-700 hover:bg-slate-50"
+                                  onClick={() => void handleDownload(artifact)}
+                                >
+                                  download
+                                </button>
+                              </span>
+                            ) : (
+                              <span className="text-slate-400">pending</span>
+                            )}
+                          </div>
+                        ) : artifact ? (
+                          <div className="my-1 ml-4 flex items-center gap-2 border-l-2 border-emerald-300 pl-3 py-2 text-[11px]">
+                            <span className="font-semibold text-emerald-700">final →</span>
+                            <span className="rounded-md bg-emerald-50 px-2 py-0.5 font-mono text-emerald-800">
+                              {tplNode.output.path}
+                            </span>
+                            <button
+                              type="button"
+                              className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-700 hover:bg-slate-50"
+                              onClick={() =>
+                                window.open(
+                                  filePreviewPath(artifact.id),
+                                  "_blank",
+                                  "noopener,noreferrer"
+                                )
+                              }
+                            >
+                              view
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-700 hover:bg-slate-50"
+                              onClick={() => void handleDownload(artifact)}
+                            >
+                              download
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800 hover:bg-emerald-100"
+                              onClick={() => void handleSaveToVault(artifact)}
+                            >
+                              Save to Vault
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+
+                  {/* Selected node JSON inspector */}
+                  <details className="rounded-xl border border-slate-200 bg-white p-3 text-xs">
+                    <summary className="cursor-pointer font-semibold text-slate-700">
+                      Selected node — JSON inspector
+                    </summary>
+                    <div className="mt-3 space-y-2">
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                          Input JSON
+                        </p>
+                        <div className="mt-1 max-h-[200px] overflow-auto rounded-lg bg-slate-50 p-2">
+                          <JsonView collapsed={1} src={selectedNode?.input_json ?? {}} />
+                        </div>
+                      </div>
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                          Output JSON
+                        </p>
+                        <div className="mt-1 max-h-[220px] overflow-auto rounded-lg bg-slate-50 p-2">
+                          <JsonView collapsed={1} src={selectedNode?.output_json ?? {}} />
+                        </div>
+                      </div>
+                    </div>
+                  </details>
                 </div>
               ) : (
                 <div className="flex h-full min-h-[400px] items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-6 text-center text-sm text-slate-500">

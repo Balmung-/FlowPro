@@ -145,13 +145,14 @@ export type Artifact = {
 export type Run = {
   id: string;
   project_id: string;
-  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "paused";
   input_message: string;
   state_json: Record<string, unknown>;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
   error_message: string | null;
+  stop_after_node_id: string | null;
 };
 
 export type NodeExecution = {

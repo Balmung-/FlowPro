@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, EmailStr
 from redis.asyncio import from_url as redis_from_url
 from sqlalchemy import desc, select, text
@@ -43,9 +44,27 @@ from app.models import (
 from app.services import StorageService, WorkflowService, validate_template_config
 from app.templates_seed import SEED_TEMPLATES
 
+logger = logging.getLogger("flowpro.api")
+
 app = FastAPI(title="FlowPro API", version="0.1.0")
 storage_service = StorageService()
 workflow_service = WorkflowService()
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Log full traceback for any unhandled exception and return a JSON envelope
+    with the exception type + message so the frontend can surface something
+    actionable instead of a bare 'Internal Server Error'."""
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": f"{type(exc).__name__}: {exc}",
+            "path": request.url.path,
+            "method": request.method,
+        },
+    )
 
 
 class RegisterRequest(BaseModel):
@@ -119,6 +138,10 @@ class MessageCreateRequest(BaseModel):
 
 class RunCreateRequest(BaseModel):
     input_message: str
+
+
+class RunUpdateRequest(BaseModel):
+    stop_after_node_id: str | None = None
 
 
 class UploadUrlRequest(BaseModel):
@@ -684,6 +707,51 @@ async def get_node_executions(
     await get_project_for_user(db, run.project_id, current_user.id)
     result = await db.execute(select(NodeExecution).where(NodeExecution.run_id == run.id).order_by(NodeExecution.node_id))
     return [serialize_node_execution(item) for item in result.scalars().all()]
+
+
+@app.patch("/runs/{run_id}")
+async def update_run(
+    run_id: str,
+    payload: RunUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Set or clear the stop point. Set stop_after_node_id to a node_id to
+    pause the run after that node completes. Pass null/empty to clear."""
+    run = await db.get(Run, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    await get_project_for_user(db, run.project_id, current_user.id)
+    run.stop_after_node_id = payload.stop_after_node_id or None
+    run.updated_at = utcnow()
+    await db.commit()
+    return serialize_run(run)
+
+
+@app.post("/runs/{run_id}/continue")
+async def continue_run(
+    run_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Clear the stop point on a paused run and re-queue it. The worker's
+    execute_run is resumable — it skips already-completed nodes and picks up
+    where the stop happened."""
+    run = await db.get(Run, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    await get_project_for_user(db, run.project_id, current_user.id)
+    if run.status not in {"paused", "queued"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is in status '{run.status}'. Only paused/queued runs can be continued.",
+        )
+    run.stop_after_node_id = None
+    run.status = "queued"
+    run.updated_at = utcnow()
+    await db.commit()
+    await workflow_service.queue_run(run.id)
+    return serialize_run(run)
 
 
 @app.get("/runs/{run_id}/events")
