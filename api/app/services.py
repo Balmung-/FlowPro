@@ -934,28 +934,201 @@ class WorkflowService:
     ) -> dict[str, Any]:
         output_format = node_config["output"]["format"]
         mock = node_config.get("mock_content")
-        if mock is None:
-            if output_format == "json":
-                content: Any = {
-                    "node_id": node_config["id"],
-                    "summary": f"Mock output for {node_config['name']}.",
-                    "input_message_preview": sub_context.get("message_short", ""),
-                }
-            else:
-                content = (
-                    f"# {node_config['name']}\n\n"
-                    "This is a deterministic mock output generated because MOCK_AI=true.\n\n"
-                    f"Request preview: {sub_context.get('message_short', '')}"
-                )
+        message = (
+            sub_context.get("message")
+            or sub_context.get("message_short")
+            or "Create a short proposal for an AI document cockpit."
+        ).strip()
+        request_line = message.rstrip(".")
+        node_key = " ".join(
+            [
+                str(node_config.get("id", "")),
+                str(node_config.get("name", "")),
+                str(node_config.get("output", {}).get("path", "")),
+            ]
+        ).lower()
+        try:
+            uploaded_files = json.loads(sub_context.get("uploaded_files", "[]"))
+        except json.JSONDecodeError:
+            uploaded_files = []
+        uploaded_names = [
+            item.get("filename") or item.get("path")
+            for item in uploaded_files
+            if isinstance(item, dict) and (item.get("filename") or item.get("path"))
+        ]
+        file_note = ", ".join(uploaded_names[:3]) if uploaded_names else "No uploaded files"
+
+        def proposal_markdown(title: str, summary_line: str) -> str:
+            return (
+                f"# {title}
+
+"
+                "## Executive summary
+"
+                f"{summary_line}
+
+"
+                "## Recommended actions
+"
+                "1. Keep the Phase 1 workflow fixed so the team can validate infrastructure before expanding scope.
+"
+                "2. Make the workspace chat-first so the user can move from request to run without leaving the main screen.
+"
+                "3. Preserve run-level artifacts so every completed run remains inspectable and auditable.
+"
+                "4. Keep MOCK_AI enabled during deployment testing so Railway, R2, Redis, Postgres, SSE, and PDF generation can be verified independently of model quality.
+
+"
+                "## Risks
+"
+                "- If runs overwrite shared outputs without immutable storage, historical inspection becomes misleading.
+"
+                "- If live updates refetch the whole workspace on every event, the UI becomes noisy and unreliable.
+"
+                "- If the primary composer is unclear, users will treat the product like a debugger instead of a document cockpit.
+
+"
+                "## Next steps
+"
+                "1. Run the fixed workflow with MOCK_AI=true in Railway.
+"
+                "2. Confirm Markdown and PDF outputs render correctly from the selected run.
+"
+                "3. Review the run logs and node outputs, then enable OpenRouter only after the infrastructure path is stable.
+"
+            )
+
+        if mock is not None:
+            content: Any = self._apply_substitutions(mock, sub_context)
+        elif output_format == "json" and "intent" in node_key:
+            content = {
+                "document_type": "proposal" if "proposal" in message.lower() else "document",
+                "target_audience": "Internal product, engineering, and operations stakeholders",
+                "goal": f"Respond clearly to the request: {request_line}",
+                "tone": "direct, operational, concise",
+                "requested_outputs": ["markdown", "pdf"],
+                "missing_information": [],
+            }
+        elif output_format == "json" and "requirement" in node_key:
+            content = {
+                "requirements": [
+                    "Produce a short internal proposal",
+                    "Keep the structure easy to scan for a power user",
+                    "Show that the workflow can generate both Markdown and PDF outputs",
+                ],
+                "constraints": [
+                    "Stay focused on Phase 1 infrastructure and usability",
+                    "Do not introduce new workflow concepts",
+                    "Keep the recommendation practical enough for Railway deployment testing",
+                ],
+                "must_include": [
+                    "Executive summary",
+                    "Recommended actions",
+                    "Risks",
+                    "Next steps",
+                ],
+                "must_avoid": [
+                    "Scope creep beyond the fixed document workflow",
+                    "Placeholder language that does not prove the app works",
+                ],
+                "source_notes": [
+                    f"User request: {request_line}",
+                    f"Uploaded files: {file_note}",
+                ],
+            }
+        elif output_format == "json" and ("critic" in node_key or "qa" in node_key):
+            content = {
+                "overall_score": 89,
+                "issues": [
+                    "The proposal should stay tightly focused on the immediate Phase 1 workflow.",
+                    "The closing section should make the Railway validation path explicit.",
+                ],
+                "recommended_fixes": [
+                    "Keep the output concise and operational.",
+                    "Spell out the run validation steps and expected outputs.",
+                ],
+                "final_instruction": "Tighten the draft into a direct internal proposal with explicit execution, risk, and next-step sections.",
+            }
+        elif "outline" in node_key:
+            content = (
+                "# Proposal outline
+
+"
+                "## Executive summary
+"
+                "## Why this matters now
+"
+                "## Recommended actions
+"
+                "## Risks
+"
+                "## Next steps
+"
+            )
+        elif "draft" in node_key and "final" not in node_key:
+            content = (
+                "# Draft proposal for an AI document cockpit
+
+"
+                "## Executive summary
+"
+                f"This draft responds to the request to {request_line.lower()}. It proposes a narrow Phase 1 release focused on a reliable chat-to-document workflow that runs on Railway and keeps every execution inspectable.
+
+"
+                "## Why this matters now
+"
+                "The team needs to prove the infrastructure path before adding more product surface area. A fixed workflow with visible node execution, reliable storage, and stable output rendering is the fastest way to validate the core value.
+
+"
+                "## Recommended actions
+"
+                "1. Keep the workflow fixed at seven nodes.
+"
+                "2. Use a chat-first workspace so the request and run initiation happen in one place.
+"
+                "3. Keep live updates focused on the selected run.
+"
+                "4. Preserve per-run artifacts for historical inspection.
+
+"
+                "## Risks
+"
+                "The biggest risk is letting the UI look complete while the selected run cannot be trusted. Another risk is coupling deployment validation to model quality instead of infrastructure correctness.
+
+"
+                "## Next steps
+"
+                "Run the workflow in MOCK_AI mode, inspect the generated files, and only then switch the environment toward live model execution.
+"
+            )
+        elif "final" in node_key or node_config.get("output", {}).get("path") == "final/output.md":
+            content = proposal_markdown(
+                "Proposal: AI document cockpit",
+                "This proposal recommends shipping a focused internal AI document cockpit that lets a power user create a project, submit a document request, run a fixed seven-step workflow, and inspect every generated artifact live from the same workspace."
+            )
         else:
-            content = self._apply_substitutions(mock, sub_context)
+            content = (
+                f"# {node_config['name']}
+
+"
+                "Deterministic mock output generated because MOCK_AI=true.
+
+"
+                f"Request: {request_line}
+"
+            )
+
+        rendered = content if isinstance(content, str) else json.dumps(content, indent=2)
+        token_input = max(96, len(message) // 4 + 90)
+        token_output = max(120, len(rendered) // 4)
+        cost_estimate = round((token_input * 0.00000035) + (token_output * 0.0000009), 6)
         return {
-            "content": content if isinstance(content, str) else json.dumps(content, indent=2),
+            "content": rendered,
             "parsed": content if isinstance(content, (dict, list)) else None,
             "model_used": f"mock/{node_config['id']}",
-            "token_input": 0,
-            "token_output": 0,
-            "cost_estimate": 0.0,
+            "token_input": token_input,
+            "token_output": token_output,
+            "cost_estimate": cost_estimate,
         }
 
     def _build_structured_user_prompt(

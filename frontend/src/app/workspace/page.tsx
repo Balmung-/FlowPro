@@ -1,13 +1,15 @@
-"use client";
+﻿"use client";
 
 import "react18-json-view/src/style.css";
 
 import clsx from "clsx";
 import JsonView from "react18-json-view";
+import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import DeleteProjectModal from "@/components/delete-project-modal";
 import {
   API_BASE,
   Artifact,
@@ -18,27 +20,21 @@ import {
   RunDetail,
   RunEvent,
   Template,
-  TemplateNodeConfig,
   User,
-  ViewerKind,
   apiFetch,
 } from "@/lib/api";
 import { clearAuthSession, getStoredToken } from "@/lib/auth";
-import DeleteProjectModal from "@/components/delete-project-modal";
-
-const STREAM_EVENT_TYPES = [
-  "run.started",
-  "node.started",
-  "node.completed",
-  "node.failed",
-  "artifact.created",
-  "run.completed",
-  "run.failed",
-  "run.paused",
-];
 
 const TAB_KEYS = ["flow", "data", "files", "output", "logs"] as const;
 type TabKey = (typeof TAB_KEYS)[number];
+type ArtifactGroupKey = "working" | "final" | "logs" | "archive";
+type OutputViewer = "markdown" | "pdf";
+
+type ProjectCreatePayload = {
+  name: string;
+  description: string;
+  template_id?: string | null;
+};
 
 const TAB_LABELS: Record<TabKey, string> = {
   flow: "Node Flow",
@@ -48,12 +44,17 @@ const TAB_LABELS: Record<TabKey, string> = {
   logs: "Logs",
 };
 
-const VIEWER_LABELS: Record<ViewerKind, string> = {
-  markdown: "Markdown",
-  pdf: "PDF",
-  json: "JSON",
-  raw: "Raw",
-};
+const RUN_EVENT_TYPES = [
+  "run.started",
+  "node.started",
+  "node.completed",
+  "node.failed",
+  "artifact.created",
+  "run.completed",
+  "run.failed",
+  "run.cancelled",
+  "run.paused",
+] as const;
 
 function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -71,17 +72,19 @@ function formatDateTime(value: string | null | undefined): string {
 function statusTone(status: string): string {
   switch (status) {
     case "running":
-      return "bg-amber-100 text-amber-900 border border-amber-200";
+      return "border-amber-200 bg-amber-50 text-amber-800";
     case "completed":
-      return "bg-emerald-100 text-emerald-900 border border-emerald-200";
+      return "border-emerald-200 bg-emerald-50 text-emerald-800";
     case "failed":
-      return "bg-red-100 text-red-900 border border-red-200";
-    case "skipped":
-      return "bg-slate-200 text-slate-700 border border-slate-300";
+      return "border-red-200 bg-red-50 text-red-800";
     case "queued":
-      return "bg-blue-100 text-blue-900 border border-blue-200";
+      return "border-blue-200 bg-blue-50 text-blue-800";
+    case "paused":
+      return "border-purple-200 bg-purple-50 text-purple-800";
+    case "skipped":
+      return "border-slate-300 bg-slate-100 text-slate-700";
     default:
-      return "bg-slate-100 text-slate-700 border border-slate-200";
+      return "border-slate-200 bg-slate-100 text-slate-700";
   }
 }
 
@@ -104,109 +107,77 @@ function toRunSummary(run: Run | RunDetail): Run {
   };
 }
 
+function buildRunLabel(run: Run): string {
+  return `${formatDateTime(run.created_at)} - ${run.status}`;
+}
+
+function buildArtifactGroups(artifacts: Artifact[]): Record<ArtifactGroupKey, Artifact[]> {
+  const groups: Record<ArtifactGroupKey, Artifact[]> = {
+    working: [],
+    final: [],
+    logs: [],
+    archive: [],
+  };
+  for (const artifact of artifacts) {
+    const group = artifact.path.split("/")[0] as ArtifactGroupKey;
+    if (group in groups) {
+      groups[group].push(artifact);
+    }
+  }
+  return groups;
+}
+
 export default function WorkspacePage() {
   const router = useRouter();
   const uploadRef = useRef<HTMLInputElement | null>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const seenEventIdsRef = useRef<Set<string>>(new Set());
-  const chatEndRef = useRef<HTMLDivElement | null>(null);
 
+  const [me, setMe] = useState<User | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [templates, setTemplates] = useState<Template[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [files, setFiles] = useState<Artifact[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState("");
   const [selectedRun, setSelectedRun] = useState<RunDetail | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState("");
   const [activeTab, setActiveTab] = useState<TabKey>("flow");
-  const [selectedNodeId, setSelectedNodeId] = useState<string>("");
+  const [outputViewer, setOutputViewer] = useState<OutputViewer>("markdown");
   const [messageInput, setMessageInput] = useState("");
+  const [error, setError] = useState<string | null>(null);
   const [showCreateProject, setShowCreateProject] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [projectDescription, setProjectDescription] = useState("");
+  const [projectTemplateId, setProjectTemplateId] = useState("");
+  const [isLoadingWorkspace, setIsLoadingWorkspace] = useState(false);
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
+  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
+  const [isStartingRun, setIsStartingRun] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [previewArtifactId, setPreviewArtifactId] = useState("");
   const [previewText, setPreviewText] = useState("");
   const [previewUrl, setPreviewUrl] = useState("");
   const [previewIsPdf, setPreviewIsPdf] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
-  const [outputViewer, setOutputViewer] = useState<ViewerKind>("markdown");
-  const [isCreatingProject, setIsCreatingProject] = useState(false);
-  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
-  const [isStartingRun, setIsStartingRun] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [me, setMe] = useState<User | null>(null);
-  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
     [projects, selectedProjectId]
   );
 
-  const activeTemplate = useMemo<Template | null>(() => {
-    if (!selectedProject?.template_id) return null;
-    return templates.find((tpl) => tpl.id === selectedProject.template_id) ?? null;
-  }, [selectedProject, templates]);
-
-  const templateNodes: TemplateNodeConfig[] = useMemo(() => {
-    const baseNodes = activeTemplate?.config_json?.nodes ?? [];
-    if (!selectedRun?.node_executions?.length) {
-      return baseNodes;
-    }
-    const baseById = new Map(baseNodes.map((node) => [node.id, node]));
-    return selectedRun.node_executions.map((execution) => {
-      const base = baseById.get(execution.node_id);
-      const artifact =
-        (selectedRun.artifacts ?? []).find(
-          (item) => item.deleted_at === null && item.run_id === selectedRun.id && item.node_id === execution.node_id
-        ) ?? null;
-      const inferredFormat = artifact?.mime_type.includes("pdf")
-        ? "pdf"
-        : artifact?.mime_type.includes("json")
-          ? "json"
-          : "markdown";
-      return {
-        id: execution.node_id,
-        name: execution.node_name,
-        type: (base?.type ?? execution.node_type) as TemplateNodeConfig["type"],
-        model: base?.model ?? execution.model_used ?? undefined,
-        model_profile: base?.model_profile ?? execution.model_profile ?? undefined,
-        system_prompt: base?.system_prompt ?? "",
-        instruction: base?.instruction,
-        include_message: base?.include_message,
-        include_uploaded_files: base?.include_uploaded_files,
-        user_prompt_template: base?.user_prompt_template ?? "",
-        reads: base?.reads ?? [],
-        output: base?.output ?? {
-          format: inferredFormat,
-          path: artifact?.path ?? "",
-          state_section: inferredFormat === "pdf" ? "final" : "working",
-          state_key: execution.node_id,
-        },
-        mock_content: base?.mock_content,
-      };
-    });
-  }, [activeTemplate, selectedRun]);
-
-  const allowedViewers: ViewerKind[] = useMemo(() => {
-    const list = activeTemplate?.config_json?.allowed_viewers ?? ["markdown", "pdf", "json"];
-    return list.length ? list : ["markdown", "pdf", "json"];
-  }, [activeTemplate]);
-
-  // Initialize default viewer when template changes.
-  useEffect(() => {
-    const fallback = activeTemplate?.config_json?.default_viewer ?? allowedViewers[0] ?? "markdown";
-    if (!allowedViewers.includes(outputViewer)) {
-      setOutputViewer(fallback);
-    }
-  }, [activeTemplate, allowedViewers, outputViewer]);
+  const selectedTemplate = useMemo(
+    () => templates.find((template) => template.id === selectedProject?.template_id) ?? null,
+    [selectedProject, templates]
+  );
 
   const selectedRunSummary = useMemo(
     () => runs.find((run) => run.id === selectedRunId) ?? selectedRun ?? null,
     [runs, selectedRun, selectedRunId]
   );
-  const selectedRunActive =
-    selectedRunSummary?.status === "queued" || selectedRunSummary?.status === "running";
+
   const isRunInProgress = useMemo(
     () => runs.some((run) => run.status === "queued" || run.status === "running"),
     [runs]
@@ -216,10 +187,8 @@ export default function WorkspacePage() {
     () => (selectedRun?.artifacts ?? []).filter((artifact) => artifact.deleted_at === null),
     [selectedRun]
   );
-  const visibleMessages = useMemo(
-    () => (selectedRunId ? messages.filter((message) => message.run_id === selectedRunId) : []),
-    [messages, selectedRunId]
-  );
+
+  const artifactGroups = useMemo(() => buildArtifactGroups(activeRunArtifacts), [activeRunArtifacts]);
 
   const projectInputFiles = useMemo(
     () =>
@@ -228,40 +197,61 @@ export default function WorkspacePage() {
       ),
     [files]
   );
-  const runFilesByGroup = useMemo(() => {
-    const grouped = {
-      working: [] as Artifact[],
-      final: [] as Artifact[],
-      logs: [] as Artifact[],
-      archive: [] as Artifact[],
-    };
-    for (const artifact of activeRunArtifacts) {
-      const section = artifact.path.split("/")[0] as keyof typeof grouped;
-      if (section in grouped) {
-        grouped[section].push(artifact);
-      }
-    }
-    return grouped;
-  }, [activeRunArtifacts]);
 
   const latestMarkdownArtifact = useMemo(
     () => activeRunArtifacts.find((artifact) => artifact.path === "final/output.md") ?? null,
     [activeRunArtifacts]
   );
+
   const latestPdfArtifact = useMemo(
     () => activeRunArtifacts.find((artifact) => artifact.path === "final/output.pdf") ?? null,
     [activeRunArtifacts]
   );
 
-  const nodeExecutions = useMemo(
-    () => new Map((selectedRun?.node_executions ?? []).map((node) => [node.node_id, node])),
-    [selectedRun]
+  const selectedRunActive =
+    selectedRunSummary?.status === "queued" || selectedRunSummary?.status === "running";
+
+  const pipelineNodes = useMemo(() => selectedRun?.node_executions ?? [], [selectedRun]);
+
+  const selectedNode = useMemo(
+    () => pipelineNodes.find((node) => node.node_id === selectedNodeId) ?? null,
+    [pipelineNodes, selectedNodeId]
   );
-  const selectedNode = nodeExecutions.get(selectedNodeId) ?? null;
-  const selectedNodeConfig = useMemo<TemplateNodeConfig | null>(
-    () => templateNodes.find((node) => node.id === selectedNodeId) ?? null,
-    [templateNodes, selectedNodeId]
+
+  const selectedNodeArtifact = useMemo(
+    () =>
+      activeRunArtifacts.find(
+        (artifact) => artifact.node_id === selectedNodeId && artifact.run_id === selectedRun?.id
+      ) ?? null,
+    [activeRunArtifacts, selectedNodeId, selectedRun]
   );
+
+  const canStartRun = Boolean(
+    selectedProjectId && messageInput.trim() && !isStartingRun && !isRunInProgress
+  );
+
+  const resetPreview = useCallback(() => {
+    setPreviewArtifactId("");
+    setPreviewText("");
+    setPreviewUrl("");
+    setPreviewIsPdf(false);
+    setPreviewError(null);
+  }, []);
+
+  const loadProjects = useCallback(async () => {
+    const projectList = await apiFetch<Project[]>("/projects");
+    setProjects(projectList);
+    setSelectedProjectId((current) => {
+      if (current && projectList.some((project) => project.id === current)) return current;
+      return projectList[0]?.id ?? "";
+    });
+  }, []);
+
+  const loadTemplates = useCallback(async () => {
+    const templateList = await apiFetch<Template[]>("/templates");
+    setTemplates(templateList);
+    setProjectTemplateId((current) => current || templateList[0]?.id || "");
+  }, []);
 
   const loadRunDetail = useCallback(async (runId: string) => {
     if (!runId) {
@@ -270,77 +260,25 @@ export default function WorkspacePage() {
     }
     const detail = await apiFetch<RunDetail>(`/runs/${runId}`);
     setSelectedRun(detail);
-    setRuns((current) =>
-      current.some((run) => run.id === detail.id)
-        ? current.map((run) => (run.id === detail.id ? toRunSummary(detail) : run))
-        : [toRunSummary(detail), ...current]
-    );
+    setRuns((current) => {
+      const summary = toRunSummary(detail);
+      return current.some((run) => run.id === summary.id)
+        ? current.map((run) => (run.id === summary.id ? summary : run))
+        : [summary, ...current];
+    });
     return detail;
   }, []);
 
-  const loadProjects = useCallback(async () => {
-    const projectList = await apiFetch<Project[]>("/projects");
-    setProjects(projectList);
-    setSelectedProjectId((current) =>
-      current && projectList.some((project) => project.id === current)
-        ? current
-        : projectList[0]?.id ?? ""
-    );
-  }, []);
-
-  const loadTemplates = useCallback(async () => {
-    const list = await apiFetch<Template[]>("/templates");
-    setTemplates(list);
-  }, []);
-
-  // Heavy refresh: pulls every project-scoped collection. Used on first load
-  // of a project, after creating a run, after uploading/deleting files. NOT
-  // used during live SSE streaming (which uses lighter targeted refreshes).
-  const loadProjectData = useCallback(
-    async (projectId: string, preferredRunId?: string) => {
-      if (!projectId) {
-        setMessages([]);
-        setFiles([]);
-        setRuns([]);
-        setSelectedRunId("");
-        setSelectedRun(null);
-        return;
-      }
-      const [nextFiles, nextRuns] = await Promise.all([
-        apiFetch<Artifact[]>(`/projects/${projectId}/files`),
-        apiFetch<Run[]>(`/projects/${projectId}/runs`),
-      ]);
-      setFiles(nextFiles);
-      setRuns(nextRuns);
-      const runIdToSelect =
-        preferredRunId && nextRuns.some((run) => run.id === preferredRunId)
-          ? preferredRunId
-          : selectedRunId && nextRuns.some((run) => run.id === selectedRunId)
-            ? selectedRunId
-            : nextRuns[0]?.id ?? "";
-      setSelectedRunId(runIdToSelect);
-      if (runIdToSelect) {
-        await loadRunDetail(runIdToSelect);
-      } else {
-        setSelectedRun(null);
-      }
-      if (!runIdToSelect) {
-        setMessages([]);
-      }
-    },
-    [loadRunDetail, selectedRunId]
-  );
-
   const refreshRunsList = useCallback(async (projectId: string) => {
     if (!projectId) return;
-    const nextRuns = await apiFetch<Run[]>(`/projects/${projectId}/runs`);
-    setRuns(nextRuns);
+    const runList = await apiFetch<Run[]>(`/projects/${projectId}/runs`);
+    setRuns(runList);
   }, []);
 
   const refreshProjectFiles = useCallback(async (projectId: string) => {
     if (!projectId) return;
-    const nextFiles = await apiFetch<Artifact[]>(`/projects/${projectId}/files`);
-    setFiles(nextFiles);
+    const projectFiles = await apiFetch<Artifact[]>(`/projects/${projectId}/files`);
+    setFiles(projectFiles);
   }, []);
 
   const refreshRunMessages = useCallback(async (projectId: string, runId: string) => {
@@ -348,49 +286,90 @@ export default function WorkspacePage() {
       setMessages([]);
       return;
     }
-    const nextMessages = await apiFetch<ChatMessage[]>(
+    const runMessages = await apiFetch<ChatMessage[]>(
       `/projects/${projectId}/messages?run_id=${encodeURIComponent(runId)}`
     );
-    setMessages(nextMessages);
+    setMessages(runMessages);
   }, []);
 
+  const loadProjectData = useCallback(
+    async (projectId: string, preferredRunId?: string) => {
+      if (!projectId) {
+        setFiles([]);
+        setRuns([]);
+        setMessages([]);
+        setSelectedRunId("");
+        setSelectedRun(null);
+        resetPreview();
+        return;
+      }
+
+      setIsLoadingWorkspace(true);
+      try {
+        const [projectFiles, projectRuns] = await Promise.all([
+          apiFetch<Artifact[]>(`/projects/${projectId}/files`),
+          apiFetch<Run[]>(`/projects/${projectId}/runs`),
+        ]);
+        setFiles(projectFiles);
+        setRuns(projectRuns);
+
+        const nextRunId =
+          preferredRunId && projectRuns.some((run) => run.id === preferredRunId)
+            ? preferredRunId
+            : selectedRunId && projectRuns.some((run) => run.id === selectedRunId)
+              ? selectedRunId
+              : projectRuns[0]?.id ?? "";
+
+        setSelectedRunId(nextRunId);
+        resetPreview();
+
+        if (nextRunId) {
+          await Promise.all([loadRunDetail(nextRunId), refreshRunMessages(projectId, nextRunId)]);
+        } else {
+          setSelectedRun(null);
+          setMessages([]);
+        }
+      } finally {
+        setIsLoadingWorkspace(false);
+      }
+    },
+    [loadRunDetail, refreshRunMessages, resetPreview, selectedRunId]
+  );
+
   const loadArtifactPreview = useCallback(async (artifact: Artifact) => {
-    setPreviewArtifactId(artifact.id);
     setPreviewError(null);
-    const contentUrl = filePreviewPath(artifact.id);
-    setPreviewUrl(contentUrl);
+    setPreviewArtifactId(artifact.id);
+    setPreviewUrl(filePreviewPath(artifact.id));
     const isPdf = artifact.mime_type.includes("pdf");
     setPreviewIsPdf(isPdf);
     if (isPdf) {
       setPreviewText("");
       return;
     }
-    if (
-      artifact.mime_type.startsWith("text/") ||
-      artifact.mime_type.includes("json") ||
-      artifact.mime_type.includes("markdown")
-    ) {
-      const response = await fetch(contentUrl, { cache: "no-store" });
-      if (!response.ok) throw new Error(`Preview failed for ${artifact.filename}`);
-      setPreviewText(await response.text());
-      return;
+    const response = await fetch(filePreviewPath(artifact.id), { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`Preview failed for ${artifact.filename}`);
     }
-    setPreviewText("Binary preview is not available for this file type.");
+    setPreviewText(await response.text());
   }, []);
 
-  // Bootstrap: auth, projects, templates.
   useEffect(() => {
-    if (!getStoredToken()) {
+    const token = getStoredToken();
+    if (!token) {
       router.replace("/login");
       return;
     }
-    loadProjects().catch((err) => setError(err instanceof Error ? err.message : "Failed to load projects."));
-    loadTemplates().catch((err) =>
-      setError(err instanceof Error ? err.message : "Failed to load templates.")
-    );
+
+    loadProjects().catch((err) => {
+      setError(err instanceof Error ? err.message : "Failed to load projects.");
+    });
+    loadTemplates().catch((err) => {
+      setError(err instanceof Error ? err.message : "Failed to load templates.");
+    });
     apiFetch<User>("/auth/me")
       .then(setMe)
       .catch(() => undefined);
+
     return () => {
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
@@ -398,52 +377,35 @@ export default function WorkspacePage() {
     };
   }, [loadProjects, loadTemplates, router]);
 
-  // When project changes, load its data.
   useEffect(() => {
     if (!selectedProjectId) {
-      setMessages([]);
       setFiles([]);
       setRuns([]);
+      setMessages([]);
       setSelectedRunId("");
       setSelectedRun(null);
+      resetPreview();
       return;
     }
-    loadProjectData(selectedProjectId).catch((err) =>
-      setError(err instanceof Error ? err.message : "Failed to load project workspace.")
-    );
-  }, [loadProjectData, selectedProjectId]);
+    loadProjectData(selectedProjectId).catch((err) => {
+      setError(err instanceof Error ? err.message : "Failed to load project workspace.");
+    });
+  }, [loadProjectData, resetPreview, selectedProjectId]);
 
-  // When the active template's nodes change and a node is unselected (or now-invalid), pick the first.
   useEffect(() => {
-    if (templateNodes.length === 0) {
+    if (pipelineNodes.length === 0) {
       setSelectedNodeId("");
       return;
     }
-    if (!templateNodes.some((node) => node.id === selectedNodeId)) {
-      setSelectedNodeId(templateNodes[0].id);
+    if (!pipelineNodes.some((node) => node.node_id === selectedNodeId)) {
+      setSelectedNodeId(pipelineNodes[0].node_id);
     }
-  }, [templateNodes, selectedNodeId]);
+  }, [pipelineNodes, selectedNodeId]);
 
-  // Run-scoped chat: whenever the selected run changes, refetch the messages
-  // for that run only. The center pane therefore reflects the same run as
-  // the right inspector — no more cross-run conversation soup.
   useEffect(() => {
-    if (!selectedProjectId) {
-      setMessages([]);
-      return;
-    }
-    if (!selectedRunId) {
-      setMessages([]);
-      return;
-    }
-    refreshRunMessages(selectedProjectId, selectedRunId)
-      .then(() => undefined)
-      .catch((err) => {
-        setError(err instanceof Error ? err.message : "Failed to load chat for this run.");
-      });
-  }, [refreshRunMessages, selectedProjectId, selectedRunId]);
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
-  // SSE for the selected run.
   useEffect(() => {
     if (!selectedProjectId || !selectedRunId) {
       eventSourceRef.current?.close();
@@ -451,6 +413,7 @@ export default function WorkspacePage() {
       seenEventIdsRef.current.clear();
       return;
     }
+
     const token = getStoredToken();
     if (!token) return;
 
@@ -462,149 +425,182 @@ export default function WorkspacePage() {
     );
     eventSourceRef.current = source;
 
-    const TERMINAL_EVENTS = new Set([
-      "run.completed",
-      "run.failed",
-      "run.cancelled",
-      "run.paused",
-    ]);
+    const terminalEvents = new Set(["run.completed", "run.failed", "run.cancelled"]);
 
-    const handleStreamMessage = (event: MessageEvent<string>) => {
+    const handleEvent = (event: MessageEvent<string>) => {
       try {
         const payload = JSON.parse(event.data) as RunEvent;
         if (seenEventIdsRef.current.has(payload.id)) return;
         seenEventIdsRef.current.add(payload.id);
 
-        // Optimistically append the event to the in-memory run detail so
-        // the Logs tab updates instantly; the next loadRunDetail will
-        // dedupe on event.id.
-        setSelectedRun((current) =>
-          !current || current.id !== selectedRunId || current.events.some((item) => item.id === payload.id)
-            ? current
-            : { ...current, events: [...current.events, payload] }
-        );
+        setSelectedRun((current) => {
+          if (!current || current.id !== selectedRunId) return current;
+          if (current.events.some((item) => item.id === payload.id)) return current;
+          return { ...current, events: [...current.events, payload] };
+        });
 
-        // Targeted refresh: every event refreshes the run detail (single
-        // API call carrying artifacts + node_executions + events). We do
-        // NOT reload the whole project on every event anymore.
         loadRunDetail(selectedRunId).catch(() => undefined);
 
-        // On terminal events, also refresh the runs list (sidebar status)
-        // and project files (so the Files tab + explorer drawer pick up
-        // newly-written run artifacts), and re-fetch this run's chat
-        // (so the assistant/system completion message appears).
         if (payload.type === "artifact.created" || payload.type === "node.completed") {
           refreshProjectFiles(selectedProjectId).catch(() => undefined);
         }
 
-        if (TERMINAL_EVENTS.has(payload.type)) {
+        if (payload.type === "run.completed" || payload.type === "run.failed" || payload.type === "run.paused") {
           refreshRunsList(selectedProjectId).catch(() => undefined);
-          refreshProjectFiles(selectedProjectId).catch(() => undefined);
           refreshRunMessages(selectedProjectId, selectedRunId).catch(() => undefined);
+          refreshProjectFiles(selectedProjectId).catch(() => undefined);
         }
 
-        // Don't close the stream on `run.paused` — a Continue might
-        // re-emit events on the same run.
-        if (payload.type === "run.completed" || payload.type === "run.failed" || payload.type === "run.cancelled") {
+        if (terminalEvents.has(payload.type)) {
           source.close();
-          if (eventSourceRef.current === source) eventSourceRef.current = null;
+          if (eventSourceRef.current === source) {
+            eventSourceRef.current = null;
+          }
         }
       } catch (streamError) {
         setError(
-          streamError instanceof Error ? streamError.message : "Failed to process live run event."
+          streamError instanceof Error
+            ? streamError.message
+            : "Failed to process live run event."
         );
       }
     };
 
-    for (const eventType of STREAM_EVENT_TYPES) {
-      source.addEventListener(eventType, handleStreamMessage as EventListener);
+    for (const eventType of RUN_EVENT_TYPES) {
+      source.addEventListener(eventType, handleEvent as EventListener);
     }
-    source.onmessage = handleStreamMessage;
 
     return () => {
       source.close();
-      if (eventSourceRef.current === source) eventSourceRef.current = null;
+      if (eventSourceRef.current === source) {
+        eventSourceRef.current = null;
+      }
     };
   }, [loadRunDetail, refreshProjectFiles, refreshRunMessages, refreshRunsList, selectedProjectId, selectedRunId]);
 
-  // Auto-load preview when output viewer or artifacts change.
   useEffect(() => {
-    let outputArtifact: Artifact | null = null;
-    if (outputViewer === "markdown") outputArtifact = latestMarkdownArtifact;
-    else if (outputViewer === "pdf") outputArtifact = latestPdfArtifact;
-    else outputArtifact = latestMarkdownArtifact ?? latestPdfArtifact;
-
-    if (!outputArtifact) {
+    const artifact = outputViewer === "markdown" ? latestMarkdownArtifact : latestPdfArtifact;
+    if (!artifact) {
       if (activeTab === "output") {
-        setPreviewArtifactId("");
-        setPreviewText("");
-        setPreviewUrl("");
-        setPreviewIsPdf(false);
+        resetPreview();
       }
       return;
     }
-    loadArtifactPreview(outputArtifact).catch((err) => {
+    if (activeTab !== "output") return;
+    loadArtifactPreview(artifact).catch((err) => {
       setPreviewError(err instanceof Error ? err.message : "Output preview failed.");
     });
-  }, [activeTab, latestMarkdownArtifact, latestPdfArtifact, loadArtifactPreview, outputViewer]);
+  }, [activeTab, latestMarkdownArtifact, latestPdfArtifact, loadArtifactPreview, outputViewer, resetPreview]);
 
-  // Auto-scroll chat to bottom on new messages.
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [selectedRun?.status, visibleMessages.length]);
+  async function handleSelectRun(runId: string) {
+    setSelectedRunId(runId);
+    resetPreview();
+    if (!selectedProjectId || !runId) {
+      setSelectedRun(null);
+      setMessages([]);
+      return;
+    }
+    try {
+      await Promise.all([loadRunDetail(runId), refreshRunMessages(selectedProjectId, runId)]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load run.");
+    }
+  }
 
   async function handleCreateProject() {
-    if (!projectName.trim()) return;
+    const name = projectName.trim();
+    if (!name) {
+      setError("Project name is required.");
+      return;
+    }
     setIsCreatingProject(true);
     setError(null);
     try {
+      const payload: ProjectCreatePayload = {
+        name,
+        description: projectDescription.trim(),
+      };
+      if (projectTemplateId) payload.template_id = projectTemplateId;
       const project = await apiFetch<Project>("/projects", {
         method: "POST",
-        body: JSON.stringify({
-          name: projectName.trim(),
-          description: projectDescription.trim(),
-        }),
+        body: JSON.stringify(payload),
       });
       setProjects((current) => [project, ...current.filter((item) => item.id !== project.id)]);
+      setSelectedProjectId(project.id);
+      setSelectedRunId("");
+      setSelectedRun(null);
+      setMessages([]);
+      setFiles([]);
+      setRuns([]);
       setProjectName("");
       setProjectDescription("");
       setShowCreateProject(false);
-      setSelectedProjectId(project.id);
-    } catch (createError) {
-      setError(createError instanceof Error ? createError.message : "Project creation failed.");
+      setActiveTab("flow");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create project.");
     } finally {
       setIsCreatingProject(false);
     }
   }
 
-  async function handleRunWorkflow() {
-    if (!selectedProjectId || !messageInput.trim()) return;
+  async function handleStartRun() {
+    if (!selectedProjectId) {
+      setError("Select a project first.");
+      return;
+    }
+    const inputMessage = messageInput.trim();
+    if (!inputMessage) {
+      setError("Type a document request first.");
+      return;
+    }
     setIsStartingRun(true);
     setError(null);
     try {
       const run = await apiFetch<Run>(`/projects/${selectedProjectId}/runs`, {
         method: "POST",
-        body: JSON.stringify({ input_message: messageInput.trim() }),
+        body: JSON.stringify({ input_message: inputMessage }),
       });
       setMessageInput("");
-      setActiveTab("flow");
       setSelectedRunId(run.id);
-      await loadProjectData(selectedProjectId, run.id);
-    } catch (runError) {
-      setError(runError instanceof Error ? runError.message : "Run creation failed.");
+      setRuns((current) => [toRunSummary(run), ...current.filter((item) => item.id !== run.id)]);
+      setActiveTab("flow");
+      resetPreview();
+      await Promise.all([
+        loadRunDetail(run.id),
+        refreshRunMessages(selectedProjectId, run.id),
+        refreshRunsList(selectedProjectId),
+      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start run.");
     } finally {
       setIsStartingRun(false);
     }
   }
 
+  async function handleContinueRun() {
+    if (!selectedRunId || !selectedProjectId) return;
+    setError(null);
+    try {
+      await apiFetch<Run>(`/runs/${selectedRunId}/continue`, { method: "POST" });
+      await Promise.all([
+        loadRunDetail(selectedRunId),
+        refreshRunsList(selectedProjectId),
+        refreshRunMessages(selectedProjectId, selectedRunId),
+      ]);
+      setActiveTab("flow");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to continue run.");
+    }
+  }
+
   async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
-    const selectedFiles = Array.from(event.target.files ?? []);
-    if (!selectedProjectId || selectedFiles.length === 0) return;
+    const selectedFiles = event.target.files;
+    if (!selectedProjectId || !selectedFiles?.length) return;
 
     setIsUploadingFiles(true);
     setError(null);
     try {
-      for (const file of selectedFiles) {
+      for (const file of Array.from(selectedFiles)) {
         const relativePath = `input/${file.name}`;
         const { upload_url } = await apiFetch<{ upload_url: string }>(
           `/projects/${selectedProjectId}/files/upload-url`,
@@ -616,12 +612,18 @@ export default function WorkspacePage() {
             }),
           }
         );
+
         const uploadResponse = await fetch(upload_url, {
           method: "PUT",
-          headers: { "Content-Type": file.type || "application/octet-stream" },
+          headers: {
+            "Content-Type": file.type || "application/octet-stream",
+          },
           body: file,
         });
-        if (!uploadResponse.ok) throw new Error(`Upload failed for ${file.name}`);
+        if (!uploadResponse.ok) {
+          throw new Error(`Upload failed for ${file.name}.`);
+        }
+
         await apiFetch(`/projects/${selectedProjectId}/files/confirm-upload`, {
           method: "POST",
           body: JSON.stringify({
@@ -632,391 +634,383 @@ export default function WorkspacePage() {
           }),
         });
       }
-      await loadProjectData(selectedProjectId, selectedRunId || undefined);
-    } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : "File upload failed.");
+      await refreshProjectFiles(selectedProjectId);
+      setActiveTab("files");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "File upload failed.");
     } finally {
-      event.target.value = "";
       setIsUploadingFiles(false);
-    }
-  }
-
-  async function handleSelectRun(runId: string) {
-    setSelectedRunId(runId);
-    setError(null);
-    if (!runId) {
-      setSelectedRun(null);
-      return;
-    }
-    try {
-      await loadRunDetail(runId);
-    } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Run load failed.");
+      if (event.target) {
+        event.target.value = "";
+      }
     }
   }
 
   async function handleDownload(artifact: Artifact) {
-    const { download_url } = await apiFetch<{ download_url: string }>(
-      `/artifacts/${artifact.id}/download-url`
-    );
-    window.open(download_url, "_blank", "noopener,noreferrer");
+    try {
+      const { download_url } = await apiFetch<{ download_url: string }>(
+        `/artifacts/${artifact.id}/download-url`
+      );
+      window.open(download_url, "_blank", "noopener,noreferrer");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Download failed.");
+    }
   }
 
   async function handleDelete(artifact: Artifact) {
+    if (!selectedProjectId) return;
+    if (!window.confirm(`Delete ${artifact.filename}?`)) return;
+
     setError(null);
     try {
       await apiFetch(`/artifacts/${artifact.id}`, { method: "DELETE" });
       if (previewArtifactId === artifact.id) {
-        setPreviewArtifactId("");
-        setPreviewText("");
-        setPreviewUrl("");
-        setPreviewIsPdf(false);
+        resetPreview();
       }
-      if (selectedProjectId) await loadProjectData(selectedProjectId, selectedRunId || undefined);
-    } catch (deleteError) {
-      setError(deleteError instanceof Error ? deleteError.message : "Delete failed.");
+      await refreshProjectFiles(selectedProjectId);
+      if (selectedRunId) {
+        await loadRunDetail(selectedRunId);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Delete failed.");
     }
   }
 
-  async function handleContinueRun() {
-    if (!selectedRunId) return;
-    setError(null);
-    try {
-      await apiFetch<Run>(`/runs/${selectedRunId}/continue`, { method: "POST" });
-      await loadRunDetail(selectedRunId);
-      if (selectedProjectId) {
-        await refreshRunsList(selectedProjectId);
-      }
-    } catch (continueError) {
-      setError(continueError instanceof Error ? continueError.message : "Run resume failed.");
-    }
-  }
-
-  function handleSignOut() {
+  function handleLogout() {
     clearAuthSession();
-    eventSourceRef.current?.close();
-    eventSourceRef.current = null;
-    seenEventIdsRef.current.clear();
-    router.push("/login");
+    router.replace("/login");
   }
-
-  const composerDisabled = !selectedProjectId || !messageInput.trim() || isStartingRun || isRunInProgress;
-
-  const showMockBanner = me?.mock_ai_enabled === true;
-  const showMissingKeyBanner =
-    me && me.mock_ai_enabled === false && me.openrouter_configured === false;
 
   return (
-    <main className="flex h-screen flex-col overflow-hidden bg-slate-50 text-slate-900">
-      {showMockBanner ? (
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900">
-            <span>
-              <span className="font-semibold">Mock AI mode is on</span> - every node returns a
-            canned response without calling OpenRouter. Outputs are fake. To use real models, set
-            <span className="mx-1 rounded bg-white px-1 py-0.5 font-mono text-[11px] text-amber-800">MOCK_AI=false</span>
-            on the api and worker services and redeploy.
-          </span>
-        </div>
-      ) : null}
-      {showMissingKeyBanner ? (
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-900">
-            <span>
-              <span className="font-semibold">OPENROUTER_API_KEY is not set.</span> Real-mode runs
-            will fail until you add the key to the api and worker services.
-          </span>
-        </div>
-      ) : null}
-      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)_440px]">
-        {/* LEFT SIDEBAR — navigation & history */}
-        <aside className="flex h-full min-h-0 flex-col border-r border-slate-200 bg-white">
-          <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.28em] text-slate-500">FlowPro</p>
-              <h1 className="mt-1 text-lg font-semibold text-slate-950">Document Cockpit</h1>
-            </div>
-            <button
-              className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-              onClick={handleSignOut}
-            >
-              Logout
-            </button>
-          </div>
-
-          <div className="space-y-2 border-b border-slate-200 px-5 py-4">
-            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
-              Submit a document request from the composer below. Each request creates a run, updates
-              the node flow on the right, and writes files into the project workspace.
-            </div>
-          </div>
-
-          <div className="flex-1 overflow-y-auto">
-            <div className="flex items-center justify-between px-5 pb-2 pt-4">
-              <h2 className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
-                Projects
-              </h2>
+    <main className="min-h-screen bg-slate-100 text-slate-900">
+      <div className="flex min-h-screen">
+        <aside className="flex w-[360px] min-w-[320px] flex-col border-r border-slate-200 bg-white">
+          <div className="border-b border-slate-200 px-5 py-5">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                  FlowPro
+                </div>
+                <h1 className="mt-2 text-2xl font-semibold text-slate-950">Document Cockpit</h1>
+                <p className="mt-1 text-sm text-slate-500">
+                  Project chat, runs, files, and outputs in one workspace.
+                </p>
+              </div>
               <button
-                className="text-xs font-medium text-blue-600 hover:underline"
-                onClick={() => setShowCreateProject((value) => !value)}
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                onClick={handleLogout}
               >
-                {showCreateProject ? "Cancel" : "New"}
+                Logout
               </button>
             </div>
 
+            <div className="mt-4 flex gap-2">
+              <Link
+                className="rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white"
+                href="/workspace"
+              >
+                Workspace
+              </Link>
+              <Link
+                className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                href="/templates"
+              >
+                Templates
+              </Link>
+            </div>
+          </div>
+
+          <div className="border-b border-slate-200 px-5 py-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                  Project
+                </p>
+                <p className="mt-1 text-sm text-slate-600">
+                  {selectedProject ? selectedProject.name : "Select or create a project."}
+                </p>
+              </div>
+              <button
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                onClick={() => setShowCreateProject((current) => !current)}
+              >
+                {showCreateProject ? "Close" : "New project"}
+              </button>
+            </div>
+
+            <select
+              className="mt-3 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+              value={selectedProjectId}
+              onChange={(event) => setSelectedProjectId(event.target.value)}
+            >
+              <option value="">Select a project</option>
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                </option>
+              ))}
+            </select>
+
             {showCreateProject ? (
-              <div className="mx-3 mb-3 rounded-2xl border border-slate-200 bg-slate-50 p-3">
+              <div className="mt-3 space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-3">
                 <input
-                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
                   placeholder="Project name"
                   value={projectName}
                   onChange={(event) => setProjectName(event.target.value)}
                 />
                 <textarea
-                  className="mt-2 min-h-[60px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-                  placeholder="Description (optional)"
+                  className="h-20 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                  placeholder="Optional description"
                   value={projectDescription}
                   onChange={(event) => setProjectDescription(event.target.value)}
                 />
-                <button
-                  className="mt-2 w-full rounded-lg bg-slate-950 px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"
-                  disabled={isCreatingProject || !projectName.trim()}
-                  onClick={handleCreateProject}
+                <select
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                  value={projectTemplateId}
+                  onChange={(event) => setProjectTemplateId(event.target.value)}
                 >
-                  {isCreatingProject ? "Creating…" : "Create project"}
-                </button>
-              </div>
-            ) : null}
-
-            <ul className="space-y-1 px-3 pb-2">
-              {projects.length === 0 ? (
-                <li className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-xs text-slate-500">
-                  No projects yet. Click <span className="font-semibold">New</span> to create one.
-                </li>
-              ) : null}
-              {projects.map((project) => {
-                const tpl = templates.find((t) => t.id === project.template_id);
-                return (
-                  <li key={project.id}>
-                    <button
-                      className={clsx(
-                        "block w-full rounded-xl px-3 py-2 text-left text-sm transition",
-                        project.id === selectedProjectId
-                          ? "bg-slate-900 text-white"
-                          : "text-slate-700 hover:bg-slate-100"
-                      )}
-                      onClick={() => setSelectedProjectId(project.id)}
-                    >
-                      <span className="block truncate font-medium">{project.name}</span>
-                      <span
-                        className={clsx(
-                          "block truncate text-[11px]",
-                          project.id === selectedProjectId ? "text-slate-300" : "text-slate-500"
-                        )}
-                      >
-                        {tpl?.name ?? "No template"}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-
-            {selectedProjectId && runs.length > 0 ? (
-              <div className="border-t border-slate-200 px-5 pb-6 pt-4">
-                <h2 className="mb-2 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
-                  Run history
-                </h2>
-                <ul className="space-y-1">
-                  {runs.map((run) => (
-                    <li key={run.id}>
-                      <button
-                        className={clsx(
-                          "block w-full rounded-lg px-3 py-1.5 text-left text-xs",
-                          run.id === selectedRunId
-                            ? "bg-slate-100 text-slate-900"
-                            : "text-slate-600 hover:bg-slate-50"
-                        )}
-                        onClick={() => void handleSelectRun(run.id)}
-                      >
-                        <span className="truncate font-mono text-[10px] text-slate-500">{run.id}</span>
-                        <span className="ml-2">{run.status}</span>
-                      </button>
-                    </li>
+                  <option value="">Default workflow</option>
+                  {templates.map((template) => (
+                    <option key={template.id} value={template.id}>
+                      {template.name}
+                    </option>
                   ))}
-                </ul>
+                </select>
+                <button
+                  className="w-full rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
+                  disabled={isCreatingProject || !projectName.trim()}
+                  onClick={() => void handleCreateProject()}
+                >
+                  {isCreatingProject ? "Creating project..." : "Create project"}
+                </button>
               </div>
             ) : null}
           </div>
 
-          {error ? (
-            <div className="mx-3 mb-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-              {error}
+          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                  Chat history
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  {selectedRun
+                    ? `Run ${selectedRun.id} - ${selectedRun.status}`
+                    : selectedProject
+                      ? "No run yet. Type a request below and click Run."
+                      : "Choose a project to begin."}
+                </p>
+              </div>
+              {selectedProject && runs.length > 0 ? (
+                <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-600">
+                  {runs.length} run{runs.length === 1 ? "" : "s"}
+                </span>
+              ) : null}
             </div>
-          ) : null}
+
+            {!selectedProject ? (
+              <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                Select a project or create one to start the document workflow.
+              </div>
+            ) : !selectedRun ? (
+              <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                No run yet. Type a document request and click Run.
+              </div>
+            ) : messages.length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                Loading chat for this run.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {messages.map((message) => {
+                  const isUser = message.role === "user";
+                  const isSystem = message.role === "system";
+                  return (
+                    <article
+                      key={message.id}
+                      className={clsx(
+                        "rounded-2xl border px-4 py-3 shadow-sm",
+                        isUser
+                          ? "ml-6 border-slate-900 bg-slate-900 text-white"
+                          : isSystem
+                            ? "mr-6 border-amber-200 bg-amber-50 text-amber-900"
+                            : "mr-6 border-slate-200 bg-white text-slate-900"
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-3 text-[11px]">
+                        <span
+                          className={clsx(
+                            "font-semibold uppercase tracking-[0.16em]",
+                            isUser ? "text-slate-200" : "text-slate-500"
+                          )}
+                        >
+                          {message.role}
+                        </span>
+                        <span className={clsx(isUser ? "text-slate-300" : "text-slate-500")}>
+                          {formatDateTime(message.created_at)}
+                        </span>
+                      </div>
+                      <p
+                        className={clsx(
+                          "mt-2 whitespace-pre-wrap text-sm leading-6",
+                          isUser ? "text-white" : "text-inherit"
+                        )}
+                      >
+                        {message.content}
+                      </p>
+                    </article>
+                  );
+                })}
+                <div ref={chatEndRef} />
+              </div>
+            )}
+          </div>
+
+          <div className="border-t border-slate-200 px-5 py-4">
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3">
+              <textarea
+                className="h-32 w-full resize-none rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm text-slate-900 outline-none"
+                placeholder="Create a short proposal for an AI document cockpit."
+                value={messageInput}
+                onChange={(event) => setMessageInput(event.target.value)}
+              />
+              <div className="mt-3 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <input
+                    ref={uploadRef}
+                    className="hidden"
+                    multiple
+                    type="file"
+                    onChange={handleUpload}
+                  />
+                  <button
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    disabled={!selectedProjectId || isUploadingFiles}
+                    onClick={() => uploadRef.current?.click()}
+                  >
+                    {isUploadingFiles ? "Uploading..." : "Upload file"}
+                  </button>
+                  <span className="text-xs text-slate-500">
+                    {projectInputFiles.length} input file{projectInputFiles.length === 1 ? "" : "s"}
+                  </span>
+                </div>
+                <button
+                  className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
+                  disabled={!canStartRun}
+                  onClick={() => void handleStartRun()}
+                >
+                  {isStartingRun ? "Starting..." : isRunInProgress ? "Run in progress" : "Run workflow"}
+                </button>
+              </div>
+              <p className="mt-3 text-xs text-slate-500">
+                The selected project will use its assigned workflow and create Markdown plus PDF outputs.
+              </p>
+            </div>
+          </div>
         </aside>
 
-        {/* CENTER — chat */}
-        <section className="flex h-full min-h-0 flex-col bg-white">
-          <header className="flex items-center justify-between gap-4 border-b border-slate-200 px-6 py-4">
-            <div className="min-w-0">
-              <h2 className="truncate text-lg font-semibold text-slate-950">
-                {selectedProject?.name ?? "Select a project"}
-              </h2>
-              <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold text-slate-700">
-                  Workflow: Document Generator
-                </span>
-                {selectedProject ? (
-                  <span className="font-mono">Root: {selectedProject.r2_root_prefix}</span>
-                ) : (
-                  <span>Pick a project on the left or create one.</span>
-                )}
-              </div>
-            </div>
-            <div className="flex shrink-0 flex-wrap items-center gap-2">
-              <select
-                className="min-w-[220px] rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700"
-                value={selectedRunId}
-                onChange={(event) => void handleSelectRun(event.target.value)}
-                disabled={runs.length === 0}
-              >
-                <option value="">{runs.length === 0 ? "No runs yet" : "Select a run"}</option>
-                {runs.map((run) => (
-                  <option key={run.id} value={run.id}>
-                    {run.status} - {run.input_message.slice(0, 48)}
-                  </option>
-                ))}
-              </select>
-              {selectedProject ? (
-                <button
-                  type="button"
-                  className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-50"
-                  onClick={() => setDeleteModalOpen(true)}
-                  title="Delete this project and its files"
-                >
-                  Delete project
-                </button>
-              ) : null}
-              {selectedRunSummary ? (
-                <span
-                  className={clsx(
-                    "rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]",
-                    statusTone(selectedRunSummary.status)
-                  )}
-                >
-                  {selectedRunSummary.status}
-                </span>
-              ) : null}
-              {selectedRunSummary?.status === "paused" ? (
-                <button
-                  type="button"
-                  className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white"
-                  onClick={() => void handleContinueRun()}
-                >
-                  Continue run
-                </button>
-              ) : null}
-            </div>
-          </header>
-
-          {!selectedProjectId ? (
-            <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-slate-500">
-              Create or select a project on the left to begin.
-            </div>
-          ) : (
-            <>
-              <div className="flex-1 overflow-y-auto px-6 py-6">
-                {visibleMessages.length === 0 ? (
-                  <div className="mx-auto max-w-2xl rounded-3xl border border-dashed border-slate-300 bg-slate-50 px-6 py-12 text-center">
-                    <h3 className="text-base font-semibold text-slate-900">Describe the document you want.</h3>
-                    <p className="mt-2 text-sm text-slate-500">
-                      {selectedRunId
-                        ? "This run has no chat messages yet. Watch the node flow and logs on the right."
-                        : "Type a request below and click Run. The Document Generator workflow will execute and you'll see live progress on the right."}
-                    </p>
-                  </div>
-                ) : (
-                  <div className="mx-auto flex max-w-3xl flex-col gap-4">
-                    {visibleMessages.map((message) => (
-                      <article
-                        key={message.id}
-                        className={clsx("rounded-3xl px-5 py-4 text-sm shadow-sm", {
-                          "self-end max-w-[85%] bg-slate-950 text-white": message.role === "user",
-                          "self-start max-w-[85%] border border-slate-200 bg-white text-slate-800":
-                            message.role === "assistant",
-                          "self-start max-w-[85%] border border-amber-200 bg-amber-50 text-amber-900":
-                            message.role === "system",
-                        })}
-                      >
-                        <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.2em] opacity-70">
-                          {message.role}
-                        </div>
-                        <div className="whitespace-pre-wrap leading-6">{message.content}</div>
-                      </article>
-                    ))}
-                    <div ref={chatEndRef} />
-                  </div>
-                )}
+        <section className="flex min-w-0 flex-1 flex-col">
+          <header className="border-b border-slate-200 bg-white px-6 py-5">
+            <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                  <span className="rounded-full bg-slate-100 px-2 py-1 font-semibold text-slate-700">
+                    {selectedProject ? selectedProject.name : "No project selected"}
+                  </span>
+                  {selectedTemplate ? <span>Workflow: {selectedTemplate.name}</span> : null}
+                  {me?.mock_ai_enabled ? (
+                    <span className="rounded-full border border-blue-200 bg-blue-50 px-2 py-1 font-semibold text-blue-700">
+                      MOCK_AI enabled
+                    </span>
+                  ) : null}
+                </div>
+                <h2 className="mt-3 text-2xl font-semibold text-slate-950">
+                  {selectedProject ? selectedProject.name : "Document workspace"}
+                </h2>
+                <p className="mt-1 max-w-3xl text-sm text-slate-500">
+                  {selectedProject
+                    ? selectedProject.description || "Run the fixed document workflow and inspect every step live."
+                    : "Create or select a project, then type a request in the composer and run the workflow."}
+                </p>
               </div>
 
-              <div className="border-t border-slate-200 bg-white px-6 py-4">
-                <div className="mx-auto max-w-3xl">
-                  <div className="rounded-3xl border border-slate-200 bg-white shadow-sm focus-within:border-slate-400">
-                    <textarea
-                      className="block w-full resize-none rounded-3xl bg-transparent px-5 py-4 text-sm text-slate-900 outline-none"
-                      placeholder={
-                        activeTemplate
-                          ? "Describe the document you want. The composer is the entry point."
-                          : "Describe the document you want..."
-                      }
-                      rows={3}
-                      value={messageInput}
-                      onChange={(event) => setMessageInput(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !composerDisabled) {
-                          event.preventDefault();
-                          void handleRunWorkflow();
-                        }
-                      }}
-                    />
-                    <div className="flex items-center justify-between gap-3 border-t border-slate-100 px-3 py-2">
-                      <div className="flex items-center gap-2">
-                        <input className="hidden" multiple ref={uploadRef} type="file" onChange={handleUpload} />
-                        <button
-                          className="rounded-xl border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60"
-                          onClick={() => uploadRef.current?.click()}
-                          disabled={!selectedProjectId || isUploadingFiles}
-                        >
-                          {isUploadingFiles ? "Uploading…" : "Upload file"}
-                        </button>
-                        <span className="text-[11px] text-slate-400">Ctrl+Enter to run</span>
-                      </div>
-                      <button
-                        className="rounded-xl bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm shadow-blue-600/20 disabled:opacity-50"
-                        disabled={composerDisabled}
-                        onClick={handleRunWorkflow}
-                      >
-                        {isStartingRun ? "Starting…" : isRunInProgress ? "Run in progress…" : "Run"}
-                      </button>
-                    </div>
+              <div className="flex flex-col gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 xl:min-w-[360px]">
+                <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
+                  <div>
+                    <label className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                      Selected run
+                    </label>
+                    <select
+                      className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900"
+                      disabled={!selectedProjectId || runs.length === 0}
+                      value={selectedRunId}
+                      onChange={(event) => void handleSelectRun(event.target.value)}
+                    >
+                      <option value="">No run selected</option>
+                      {runs.map((run) => (
+                        <option key={run.id} value={run.id}>
+                          {buildRunLabel(run)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex items-end">
+                    <span
+                      className={clsx(
+                        "inline-flex rounded-full border px-3 py-2 text-xs font-semibold",
+                        statusTone(selectedRunSummary?.status ?? "idle")
+                      )}
+                    >
+                      {selectedRunSummary?.status ?? "idle"}
+                    </span>
                   </div>
                 </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
+                    disabled={!canStartRun}
+                    onClick={() => void handleStartRun()}
+                  >
+                    {isStartingRun ? "Starting..." : "Run current message"}
+                  </button>
+                  {selectedRunSummary?.status === "paused" ? (
+                    <button
+                      className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                      onClick={() => void handleContinueRun()}
+                    >
+                      Continue run
+                    </button>
+                  ) : null}
+                  {selectedProject ? (
+                    <button
+                      className="rounded-xl border border-red-200 bg-white px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-50"
+                      onClick={() => setDeleteModalOpen(true)}
+                    >
+                      Delete project
+                    </button>
+                  ) : null}
+                </div>
               </div>
-            </>
-          )}
-        </section>
+            </div>
 
-        {/* RIGHT INSPECTOR */}
-        <aside className="flex h-full min-h-0 flex-col border-l border-slate-200 bg-white">
-          <div className="border-b border-slate-200 px-4 py-3">
-            <div className="flex flex-wrap gap-1.5">
+            {error ? (
+              <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                {error}
+              </div>
+            ) : null}
+          </header>
+
+          <div className="border-b border-slate-200 bg-white px-6">
+            <div className="flex flex-wrap gap-2 py-4">
               {TAB_KEYS.map((tab) => (
                 <button
                   key={tab}
                   className={clsx(
-                    "rounded-lg px-3 py-1.5 text-xs font-semibold transition",
+                    "rounded-xl px-4 py-2 text-sm font-semibold transition",
                     activeTab === tab
                       ? "bg-slate-900 text-white"
-                      : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                      : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
                   )}
                   onClick={() => setActiveTab(tab)}
                 >
@@ -1026,589 +1020,523 @@ export default function WorkspacePage() {
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4">
-            {/* NODE FLOW */}
-            {activeTab === "flow" ? (
-              selectedRun && templateNodes.length > 0 ? (
-                <div className="space-y-3">
-                  {/* Run header */}
-                  <div className="rounded-xl border border-slate-200 bg-white p-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                          Run | {selectedRun.id}
-                        </p>
-                        <p className="mt-0.5 truncate text-[11px] text-slate-500">
-                          {selectedRun.input_message}
-                        </p>
-                      </div>
-                      <span
-                        className={clsx(
-                          "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em]",
-                          statusTone(selectedRun.status)
-                        )}
-                        >
-                          {selectedRun.status}
-                        </span>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
+            {!selectedProject ? (
+              <div className="flex min-h-[520px] items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white px-8 text-center">
+                <div>
+                  <h3 className="text-xl font-semibold text-slate-950">No project selected</h3>
+                  <p className="mt-2 max-w-xl text-sm text-slate-500">
+                    Select a project from the sidebar or create a new one. Then type a document request and click Run.
+                  </p>
+                </div>
+              </div>
+            ) : isLoadingWorkspace ? (
+              <div className="flex min-h-[520px] items-center justify-center rounded-3xl border border-slate-200 bg-white px-8 text-center text-sm text-slate-500">
+                Loading workspace...
+              </div>
+            ) : activeTab === "flow" ? (
+              !selectedRun ? (
+                <div className="flex min-h-[520px] items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white px-8 text-center">
+                  <div>
+                    <h3 className="text-xl font-semibold text-slate-950">No run yet</h3>
+                    <p className="mt-2 max-w-xl text-sm text-slate-500">
+                      Type a document request in the composer and click Run. The workflow steps will appear here once a run exists.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="grid gap-6 xl:grid-cols-[380px_minmax(0,1fr)]">
+                  <div className="space-y-4">
+                    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                      <h3 className="text-base font-semibold text-slate-950">Pipeline</h3>
+                      <p className="mt-1 text-sm text-slate-500">
+                        Seven workflow steps for the selected run. Click a step for details.
+                      </p>
                     </div>
+                    {pipelineNodes.map((node, index) => {
+                      const artifact = activeRunArtifacts.find((item) => item.node_id === node.node_id) ?? null;
+                      const isSelected = selectedNodeId === node.node_id;
+                      return (
+                        <div key={node.id} className="relative pl-6">
+                          {index < pipelineNodes.length - 1 ? (
+                            <span className="absolute left-[14px] top-14 h-[calc(100%+12px)] w-px bg-slate-200" />
+                          ) : null}
+                          <span className="absolute left-[6px] top-7 h-4 w-4 rounded-full border-2 border-slate-200 bg-white" />
+                          <button
+                            className={clsx(
+                              "w-full rounded-2xl border p-4 text-left shadow-sm transition",
+                              isSelected
+                                ? "border-slate-900 bg-slate-900 text-white"
+                                : "border-slate-200 bg-white hover:border-slate-300"
+                            )}
+                            onClick={() => setSelectedNodeId(node.node_id)}
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p
+                                  className={clsx(
+                                    "text-xs font-semibold uppercase tracking-[0.18em]",
+                                    isSelected ? "text-slate-300" : "text-slate-500"
+                                  )}
+                                >
+                                  Step {index + 1}
+                                </p>
+                                <h4
+                                  className={clsx(
+                                    "mt-1 text-base font-semibold",
+                                    isSelected ? "text-white" : "text-slate-950"
+                                  )}
+                                >
+                                  {node.node_name}
+                                </h4>
+                              </div>
+                              <span
+                                className={clsx(
+                                  "rounded-full border px-2 py-1 text-[11px] font-semibold",
+                                  statusTone(node.status),
+                                  isSelected && "border-white/20 bg-white/10 text-white"
+                                )}
+                              >
+                                {node.status}
+                              </span>
+                            </div>
+                            <dl
+                              className={clsx(
+                                "mt-4 grid grid-cols-2 gap-3 text-xs",
+                                isSelected ? "text-slate-200" : "text-slate-600"
+                              )}
+                            >
+                              <div>
+                                <dt className={clsx("font-semibold", isSelected ? "text-slate-300" : "text-slate-500")}>Model</dt>
+                                <dd className="mt-1 break-words">{node.model_used ?? node.model_profile ?? "-"}</dd>
+                              </div>
+                              <div>
+                                <dt className={clsx("font-semibold", isSelected ? "text-slate-300" : "text-slate-500")}>Tokens</dt>
+                                <dd className="mt-1">{(node.token_input ?? 0) + (node.token_output ?? 0)}</dd>
+                              </div>
+                              <div>
+                                <dt className={clsx("font-semibold", isSelected ? "text-slate-300" : "text-slate-500")}>Cost</dt>
+                                <dd className="mt-1">{node.cost_estimate != null ? `$${node.cost_estimate.toFixed(4)}` : "-"}</dd>
+                              </div>
+                              <div>
+                                <dt className={clsx("font-semibold", isSelected ? "text-slate-300" : "text-slate-500")}>Output</dt>
+                                <dd className="mt-1 break-all">{artifact?.path ?? "Pending"}</dd>
+                              </div>
+                            </dl>
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
 
-                  {/* Vertical stack of nodes */}
-                  {templateNodes.map((tplNode, index) => {
-                    const exec = nodeExecutions.get(tplNode.id);
-                    const status = exec?.status ?? "waiting";
-                    const isSelected = tplNode.id === selectedNodeId;
-                    const artifact =
-                      selectedRun.artifacts?.find(
-                        (a) =>
-                          a.deleted_at === null &&
-                          a.run_id === selectedRun.id &&
-                          a.node_id === tplNode.id
-                      ) ?? null;
-                    const nextNode = templateNodes[index + 1];
-                    const modelDisplay =
-                      exec?.model_used ??
-                      tplNode.model ??
-                      tplNode.model_profile ??
-                      (tplNode.type === "pdf_generator" ? "no model" : "-");
-                    return (
-                      <div key={tplNode.id}>
-                        {/* Node card */}
-                        <button
-                          type="button"
-                          className={clsx(
-                            "block w-full rounded-xl border p-3 text-left transition",
-                            isSelected
-                              ? "border-slate-900 bg-white shadow-md"
-                              : "border-slate-200 bg-white hover:border-slate-300"
-                          )}
-                          onClick={() => setSelectedNodeId(tplNode.id)}
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                                Step {index + 1} | {tplNode.type}
-                              </p>
-                              <h3 className="mt-0.5 text-sm font-semibold text-slate-900">
-                                {tplNode.name}
-                              </h3>
-                            </div>
-                            <span
-                              className={clsx(
-                                "shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em]",
-                                statusTone(status)
-                              )}
-                            >
-                              {status}
-                            </span>
+                  <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    {selectedNode ? (
+                      <div className="space-y-5">
+                        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                          <div>
+                            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                              Node details
+                            </p>
+                            <h3 className="mt-2 text-2xl font-semibold text-slate-950">
+                              {selectedNode.node_name}
+                            </h3>
+                            <p className="mt-1 text-sm text-slate-500">
+                              {selectedNode.node_type} node for run {selectedRun.id}
+                            </p>
                           </div>
-                          <dl className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-                            <div>
-                              <dt className="text-slate-500">Model</dt>
-                              <dd className="mt-0.5 break-words text-slate-700">{modelDisplay}</dd>
-                            </div>
-                            <div>
-                              <dt className="text-slate-500">Tokens / Cost</dt>
-                              <dd className="mt-0.5 text-slate-700">
-                                {(exec?.token_input ?? 0) + (exec?.token_output ?? 0)} |{" "}
-                                {exec?.cost_estimate != null
-                                  ? `$${exec.cost_estimate.toFixed(4)}`
-                                  : "-"}
-                              </dd>
-                            </div>
-                            {tplNode.reads?.length ? (
-                              <div className="col-span-2">
-                                <dt className="text-slate-500">Reads</dt>
-                                <dd className="mt-0.5 break-all font-mono text-[10px] text-slate-700">
-                                  {tplNode.reads.join(", ")}
-                                </dd>
-                              </div>
-                            ) : null}
-                          </dl>
-                          {exec?.error_message ? (
-                            <div className="mt-2 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-[11px] text-red-700">
-                              {exec.error_message}
-                            </div>
-                          ) : null}
-                        </button>
+                          <span className={clsx("rounded-full border px-3 py-2 text-sm font-semibold", statusTone(selectedNode.status))}>
+                            {selectedNode.status}
+                          </span>
+                        </div>
+                        <dl className="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:grid-cols-2 xl:grid-cols-4">
+                          <div>
+                            <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Model</dt>
+                            <dd className="mt-1 break-words text-sm text-slate-900">{selectedNode.model_used ?? selectedNode.model_profile ?? "-"}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Token input</dt>
+                            <dd className="mt-1 text-sm text-slate-900">{selectedNode.token_input ?? 0}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Token output</dt>
+                            <dd className="mt-1 text-sm text-slate-900">{selectedNode.token_output ?? 0}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Cost</dt>
+                            <dd className="mt-1 text-sm text-slate-900">{selectedNode.cost_estimate != null ? `$${selectedNode.cost_estimate.toFixed(4)}` : "-"}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Started</dt>
+                            <dd className="mt-1 text-sm text-slate-900">{formatDateTime(selectedNode.started_at)}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Completed</dt>
+                            <dd className="mt-1 text-sm text-slate-900">{formatDateTime(selectedNode.completed_at)}</dd>
+                          </div>
+                          <div className="sm:col-span-2">
+                            <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Artifact</dt>
+                            <dd className="mt-1 break-all text-sm text-slate-900">{selectedNodeArtifact?.path ?? "-"}</dd>
+                          </div>
+                        </dl>
 
-                        {/* File arrow between this node and the next */}
-                        {nextNode ? (
-                          <div className="my-1 ml-4 flex items-center gap-2 border-l-2 border-dashed border-slate-200 pl-3 py-2 text-[11px]">
-                            <span className="text-slate-400">↓</span>
-                            <span
-                              className={clsx(
-                                "rounded-md px-2 py-0.5 font-mono",
-                                artifact
-                                  ? "bg-emerald-50 text-emerald-800"
-                                  : "bg-slate-100 text-slate-500"
-                              )}
-                            >
-                              {tplNode.output.path}
-                            </span>
-                            {artifact ? (
-                              <span className="flex gap-1">
-                                <button
-                                  type="button"
-                                  className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-700 hover:bg-slate-50"
-                                  onClick={() =>
-                                    window.open(
-                                      filePreviewPath(artifact.id),
-                                      "_blank",
-                                      "noopener,noreferrer"
-                                    )
-                                  }
-                                >
-                                  view
-                                </button>
-                                <button
-                                  type="button"
-                                  className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-700 hover:bg-slate-50"
-                                  onClick={() => void handleDownload(artifact)}
-                                >
-                                  download
-                                </button>
-                              </span>
-                            ) : (
-                              <span className="text-slate-400">pending</span>
-                            )}
-                          </div>
-                        ) : artifact ? (
-                          <div className="my-1 ml-4 flex items-center gap-2 border-l-2 border-emerald-300 pl-3 py-2 text-[11px]">
-                            <span className="font-semibold text-emerald-700">final →</span>
-                            <span className="rounded-md bg-emerald-50 px-2 py-0.5 font-mono text-emerald-800">
-                              {tplNode.output.path}
-                            </span>
-                            <button
-                              type="button"
-                              className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-700 hover:bg-slate-50"
-                              onClick={() =>
-                                window.open(
-                                  filePreviewPath(artifact.id),
-                                  "_blank",
-                                  "noopener,noreferrer"
-                                )
-                              }
-                            >
-                              view
-                            </button>
-                            <button
-                              type="button"
-                              className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-700 hover:bg-slate-50"
-                              onClick={() => void handleDownload(artifact)}
-                            >
-                              download
-                            </button>
+                        {selectedNode.error_message ? (
+                          <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                            {selectedNode.error_message}
                           </div>
                         ) : null}
-                      </div>
-                    );
-                  })}
 
-                  {/* Selected node JSON inspector */}
-                  <details className="rounded-xl border border-slate-200 bg-white p-3 text-xs">
-                    <summary className="cursor-pointer font-semibold text-slate-700">
-                      Selected node - JSON inspector
-                    </summary>
-                    <div className="mt-3 space-y-2">
-                      <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                          Input JSON
-                        </p>
-                        <div className="mt-1 max-h-[200px] overflow-auto rounded-lg bg-slate-50 p-2">
-                          <JsonView collapsed={1} src={selectedNode?.input_json ?? {}} />
+                        <div className="grid gap-4 xl:grid-cols-2">
+                          <section className="rounded-2xl border border-slate-200 p-4">
+                            <h4 className="text-sm font-semibold text-slate-900">Input JSON</h4>
+                            <div className="mt-3 overflow-auto rounded-xl bg-slate-50 p-3">
+                              <JsonView collapsed={1} src={selectedNode.input_json ?? {}} />
+                            </div>
+                          </section>
+                          <section className="rounded-2xl border border-slate-200 p-4">
+                            <h4 className="text-sm font-semibold text-slate-900">Output JSON</h4>
+                            <div className="mt-3 overflow-auto rounded-xl bg-slate-50 p-3">
+                              <JsonView collapsed={1} src={selectedNode.output_json ?? {}} />
+                            </div>
+                          </section>
                         </div>
                       </div>
-                      <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                          Output JSON
-                        </p>
-                        <div className="mt-1 max-h-[220px] overflow-auto rounded-lg bg-slate-50 p-2">
-                          <JsonView collapsed={1} src={selectedNode?.output_json ?? {}} />
-                        </div>
+                    ) : (
+                      <div className="flex min-h-[420px] items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-slate-50 text-sm text-slate-500">
+                        Select a node to inspect its execution details.
                       </div>
-                    </div>
-                  </details>
-                </div>
-              ) : (
-                <div className="flex h-full min-h-[400px] items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-6 text-center text-sm text-slate-500">
-                  {selectedProject
-                    ? "No run yet. Type a document request and click Run."
-                    : "Select or create a project to begin."}
+                    )}
+                  </div>
                 </div>
               )
-            ) : null}
-
-            {/* DATA INSPECTOR */}
-            {activeTab === "data" ? (
+            ) : activeTab === "data" ? (
               selectedRun ? (
-                <div className="overflow-auto rounded-2xl border border-slate-200 bg-white p-4">
-                  <JsonView collapsed={2} src={selectedRun.state_json ?? {}} />
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <h3 className="text-xl font-semibold text-slate-950">Run state</h3>
+                      <p className="mt-1 text-sm text-slate-500">
+                        The selected run state updates as each node completes.
+                      </p>
+                    </div>
+                    <span className={clsx("rounded-full border px-3 py-2 text-xs font-semibold", statusTone(selectedRun.status))}>
+                      {selectedRun.status}
+                    </span>
+                  </div>
+                  <div className="mt-4 overflow-auto rounded-2xl bg-slate-50 p-4">
+                    <JsonView collapsed={1} src={selectedRun.state_json ?? {}} />
+                  </div>
                 </div>
               ) : (
-                <div className="flex h-full min-h-[400px] items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-slate-50 text-sm text-slate-500">
-                  Select a run to inspect its state_json.
+                <div className="flex min-h-[520px] items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white px-8 text-center text-sm text-slate-500">
+                  No run selected. Type a document request and click Run.
                 </div>
               )
-            ) : null}
-
-            {/* FILES */}
-            {activeTab === "files" ? (
-              <div className="space-y-5">
-                <section>
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <h3 className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
-                      Project input files
-                    </h3>
-                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+            ) : activeTab === "files" ? (
+              <div className="space-y-6">
+                <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-lg font-semibold text-slate-950">Project input files</h3>
+                      <p className="mt-1 text-sm text-slate-500">
+                        Files uploaded to this project under input/.
+                      </p>
+                    </div>
+                    <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
                       {projectInputFiles.length}
                     </span>
                   </div>
-                  {projectInputFiles.length === 0 ? (
-                    <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs text-slate-500">
-                      No uploaded input files yet.
-                    </div>
-                  ) : (
-                    <div className="space-y-2">
-                      {projectInputFiles.map((artifact) => (
-                        <div
-                          key={`${artifact.id}-${artifact.path}`}
-                          className="rounded-xl border border-slate-200 bg-white p-3"
-                        >
-                          <div className="flex flex-col gap-2">
+                  <div className="mt-4 space-y-3">
+                    {projectInputFiles.length === 0 ? (
+                      <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-center text-sm text-slate-500">
+                        No uploaded input files yet.
+                      </div>
+                    ) : (
+                      projectInputFiles.map((artifact) => (
+                        <article key={artifact.id} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                             <div>
-                              <p className="truncate text-sm font-semibold text-slate-900">
-                                {artifact.filename}
-                              </p>
-                              <p className="mt-0.5 break-all text-[10px] text-slate-500">
-                                {artifact.path}
-                              </p>
-                              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-slate-500">
+                              <h4 className="text-sm font-semibold text-slate-950">{artifact.filename}</h4>
+                              <p className="mt-1 break-all text-xs text-slate-500">{artifact.path}</p>
+                              <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-500">
                                 <span>{artifact.mime_type}</span>
                                 <span>{formatBytes(artifact.size_bytes)}</span>
                                 <span>{formatDateTime(artifact.created_at)}</span>
                               </div>
                             </div>
-                            <div className="flex flex-wrap gap-1.5">
-                              <button
-                                className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
-                                onClick={() =>
-                                  loadArtifactPreview(artifact).catch((err) =>
-                                    setPreviewError(
-                                      err instanceof Error ? err.message : "Preview failed."
-                                    )
-                                  )
-                                }
-                              >
-                                Preview
-                              </button>
-                              <button
-                                className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
-                                onClick={() => void handleDownload(artifact)}
-                              >
-                                Download
-                              </button>
-                              <button
-                                className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
-                                onClick={() => navigator.clipboard.writeText(artifact.path).catch(() => undefined)}
-                              >
-                                Copy path
-                              </button>
-                              <button
-                                className="rounded-md border border-red-200 px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50"
-                                onClick={() => void handleDelete(artifact)}
-                              >
-                                Delete
-                              </button>
+                            <div className="flex flex-wrap gap-2">
+                              <button className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={() => loadArtifactPreview(artifact).catch((err) => setPreviewError(err instanceof Error ? err.message : "Preview failed."))}>Preview</button>
+                              <button className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={() => void handleDownload(artifact)}>Download</button>
+                              <button className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={() => navigator.clipboard.writeText(artifact.path).catch(() => undefined)}>Copy path</button>
+                              <button className="rounded-lg border border-red-200 bg-white px-3 py-2 text-xs font-semibold text-red-700 hover:bg-red-50" onClick={() => void handleDelete(artifact)}>Delete</button>
                             </div>
                           </div>
-                        </div>
+                        </article>
+                      ))
+                    )}
+                  </div>
+                </section>
+
+                <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-lg font-semibold text-slate-950">Selected run artifacts</h3>
+                      <p className="mt-1 text-sm text-slate-500">
+                        Working, final, log, and archive files for the selected run.
+                      </p>
+                    </div>
+                    <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+                      {selectedRun ? activeRunArtifacts.length : 0}
+                    </span>
+                  </div>
+
+                  {!selectedRun ? (
+                    <div className="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-center text-sm text-slate-500">
+                      Select or create a run to inspect generated artifacts.
+                    </div>
+                  ) : (
+                    <div className="mt-4 space-y-5">
+                      {(["working", "final", "logs", "archive"] as ArtifactGroupKey[]).map((group) => (
+                        <section key={group}>
+                          <div className="mb-3 flex items-center justify-between gap-3">
+                            <h4 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                              {group}
+                            </h4>
+                            <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] font-semibold text-slate-700">
+                              {artifactGroups[group].length}
+                            </span>
+                          </div>
+                          {artifactGroups[group].length === 0 ? (
+                            <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-4 text-sm text-slate-500">
+                              No {group} artifacts for this run.
+                            </div>
+                          ) : (
+                            <div className="space-y-3">
+                              {artifactGroups[group].map((artifact) => (
+                                <article key={artifact.id} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                                  <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                                    <div>
+                                      <h5 className="text-sm font-semibold text-slate-950">{artifact.filename}</h5>
+                                      <p className="mt-1 break-all text-xs text-slate-500">{artifact.path}</p>
+                                      <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-500">
+                                        <span>{artifact.mime_type}</span>
+                                        <span>{formatBytes(artifact.size_bytes)}</span>
+                                        <span>{formatDateTime(artifact.created_at)}</span>
+                                      </div>
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                      <button className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={() => loadArtifactPreview(artifact).catch((err) => setPreviewError(err instanceof Error ? err.message : "Preview failed."))}>Preview</button>
+                                      <button className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={() => void handleDownload(artifact)}>Download</button>
+                                      <button className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={() => navigator.clipboard.writeText(artifact.path).catch(() => undefined)}>Copy path</button>
+                                      <button className="rounded-lg border border-red-200 bg-white px-3 py-2 text-xs font-semibold text-red-700 hover:bg-red-50" onClick={() => void handleDelete(artifact)}>Delete</button>
+                                    </div>
+                                  </div>
+                                </article>
+                              ))}
+                            </div>
+                          )}
+                        </section>
                       ))}
                     </div>
                   )}
                 </section>
-                <section className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3 text-xs text-slate-600">
-                  {selectedRun
-                    ? `Selected run artifacts are shown below for run ${selectedRun.id}.`
-                    : "Select a run to inspect working, final, log, and archive artifacts."}
-                </section>
-                {(["working", "final", "logs", "archive"] as const).map((group) => (
-                  <section key={group}>
-                    <div className="mb-2 flex items-center justify-between gap-3">
-                      <h3 className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
-                        {group}
-                      </h3>
-                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
-                        {runFilesByGroup[group].length}
-                      </span>
-                    </div>
-                    {runFilesByGroup[group].length === 0 ? (
-                      <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs text-slate-500">
-                        {selectedRun ? "Empty for this run." : "Select a run first."}
-                      </div>
-                    ) : (
-                      <div className="space-y-2">
-                        {runFilesByGroup[group].map((artifact) => (
-                          <div
-                            key={`${artifact.id}-${artifact.path}`}
-                            className="rounded-xl border border-slate-200 bg-white p-3"
-                          >
-                            <div className="flex flex-col gap-2">
-                              <div>
-                                <p className="truncate text-sm font-semibold text-slate-900">
-                                  {artifact.filename}
-                                </p>
-                                <p className="mt-0.5 break-all text-[10px] text-slate-500">
-                                  {artifact.path}
-                                </p>
-                                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-slate-500">
-                                  <span>{artifact.mime_type}</span>
-                                  <span>{formatBytes(artifact.size_bytes)}</span>
-                                  <span>{formatDateTime(artifact.created_at)}</span>
-                                </div>
-                              </div>
-                              <div className="flex flex-wrap gap-1.5">
-                                <button
-                                  className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
-                                  onClick={() =>
-                                    loadArtifactPreview(artifact).catch((err) =>
-                                      setPreviewError(
-                                        err instanceof Error ? err.message : "Preview failed."
-                                      )
-                                    )
-                                  }
-                                >
-                                  Preview
-                                </button>
-                                <button
-                                  className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
-                                  onClick={() => void handleDownload(artifact)}
-                                >
-                                  Download
-                                </button>
-                                <button
-                                  className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-50"
-                                  onClick={() =>
-                                    navigator.clipboard
-                                      .writeText(artifact.path)
-                                      .catch(() => undefined)
-                                  }
-                                >
-                                  Copy path
-                                </button>
-                                <button
-                                  className="rounded-md border border-red-200 px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50"
-                                  onClick={() => void handleDelete(artifact)}
-                                >
-                                  Delete
-                                </button>
-                              </div>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </section>
-                ))}
+
                 {previewArtifactId && previewUrl ? (
-                  <section>
-                    <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
-                      Preview
-                    </h3>
-                    {previewIsPdf ? (
-                      <iframe
-                        className="h-[420px] w-full rounded-xl border border-slate-200 bg-white"
-                        src={previewUrl}
-                      />
+                  <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <h3 className="text-lg font-semibold text-slate-950">Preview</h3>
+                      <button className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50" onClick={resetPreview}>Close preview</button>
+                    </div>
+                    {previewError ? (
+                      <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                        {previewError}
+                      </div>
+                    ) : previewIsPdf ? (
+                      <iframe className="mt-4 h-[520px] w-full rounded-2xl border border-slate-200 bg-white" src={previewUrl} />
                     ) : (
-                      <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap rounded-xl bg-slate-50 p-3 text-xs leading-5 text-slate-700">
+                      <pre className="mt-4 max-h-[520px] overflow-auto whitespace-pre-wrap rounded-2xl bg-slate-50 p-4 text-sm leading-6 text-slate-700">
                         {previewText}
                       </pre>
                     )}
                   </section>
                 ) : null}
               </div>
-            ) : null}
-
-            {/* OUTPUT VIEWER */}
-            {activeTab === "output" ? (
-              selectedRun ? (
-                <div className="space-y-3">
-                  <div className="flex flex-wrap gap-1.5">
-                    {allowedViewers.map((viewer) => (
-                      <button
-                        key={viewer}
-                        className={clsx(
-                          "rounded-lg px-3 py-1.5 text-xs font-semibold",
-                          outputViewer === viewer
-                            ? "bg-slate-900 text-white"
-                            : "border border-slate-200 bg-white text-slate-700"
-                        )}
-                        onClick={() => setOutputViewer(viewer)}
-                      >
-                        {VIEWER_LABELS[viewer]}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="overflow-y-auto rounded-2xl border border-slate-200 bg-white p-4">
-                    {previewError ? (
-                      <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-                        {previewError}
-                      </p>
-                    ) : null}
-                    {outputViewer === "markdown" ? (
-                      latestMarkdownArtifact ? (
-                        <article className="prose prose-slate max-w-none prose-headings:text-slate-950">
-                          <ReactMarkdown>
-                            {previewArtifactId === latestMarkdownArtifact.id ? previewText : ""}
-                          </ReactMarkdown>
-                        </article>
-                      ) : (
-                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-6 text-center text-sm text-slate-500">
-                          {selectedRunActive
-                            ? "Output will appear when final files are created."
-                            : "No final markdown for this run."}
-                        </div>
-                      )
-                    ) : outputViewer === "pdf" ? (
-                      latestPdfArtifact ? (
-                        <iframe
-                          className="h-[560px] w-full rounded-xl border border-slate-200 bg-white"
-                          src={
-                            previewArtifactId === latestPdfArtifact.id
-                              ? previewUrl
-                              : filePreviewPath(latestPdfArtifact.id)
-                          }
-                        />
-                      ) : (
-                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-6 text-center text-sm text-slate-500">
-                          {selectedRunActive ? "PDF will appear when generated." : "No final PDF for this run."}
-                        </div>
-                      )
-                    ) : outputViewer === "json" ? (
-                      <div className="overflow-auto">
-                        <JsonView collapsed={2} src={selectedRun.state_json ?? {}} />
-                      </div>
-                    ) : (
-                      <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap rounded-xl bg-slate-50 p-3 text-xs text-slate-700">
-                        {previewText}
-                      </pre>
-                    )}
-                  </div>
-                </div>
-              ) : (
-                <div className="flex h-full min-h-[400px] items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-6 text-center text-sm text-slate-500">
+            ) : activeTab === "output" ? (
+              !selectedRun ? (
+                <div className="flex min-h-[520px] items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white px-8 text-center text-sm text-slate-500">
                   No run selected.
                 </div>
-              )
-            ) : null}
-
-            {/* LOGS */}
-            {activeTab === "logs" ? (
-              <div className="space-y-4">
-                {selectedRun ? (
-                  <>
-                    <section className="rounded-2xl border border-slate-200 bg-white p-4">
-                      <h3 className="text-sm font-semibold text-slate-900">Run summary</h3>
-                      <dl className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-700">
-                        <div>
-                          <dt className="text-slate-500">Status</dt>
-                          <dd>{selectedRun.status}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Created</dt>
-                          <dd>{formatDateTime(selectedRun.created_at)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Updated</dt>
-                          <dd>{formatDateTime(selectedRun.updated_at)}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-500">Completed</dt>
-                          <dd>{formatDateTime(selectedRun.completed_at)}</dd>
-                        </div>
-                      </dl>
-                      {selectedRun.error_message ? (
-                        <div className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-                          {selectedRun.error_message}
-                        </div>
-                      ) : null}
-                    </section>
-
-                    <section>
-                      <h3 className="mb-2 text-sm font-semibold text-slate-900">Run events</h3>
-                      {(selectedRun.events ?? []).length === 0 ? (
-                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs text-slate-500">
-                          No events yet.
-                        </div>
-                      ) : (
-                        <div className="space-y-2">
-                          {selectedRun.events.map((event) => (
-                            <article key={event.id} className="rounded-xl border border-slate-200 bg-white p-3">
-                              <div className="flex items-center justify-between gap-2">
-                                <p className="text-xs font-semibold text-slate-900">{event.type}</p>
-                                <span className="text-[10px] text-slate-500">
-                                  {formatDateTime(event.created_at)}
-                                </span>
-                              </div>
-                              <pre className="mt-2 max-h-[140px] overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-2 text-[10px] leading-4 text-slate-700">
-                                {JSON.stringify(event.event_json, null, 2)}
-                              </pre>
-                            </article>
-                          ))}
-                        </div>
-                      )}
-                    </section>
-
-                    <section>
-                      <h3 className="mb-2 text-sm font-semibold text-slate-900">Node executions</h3>
-                      {(selectedRun.node_executions ?? []).length === 0 ? (
-                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-xs text-slate-500">
-                          None.
-                        </div>
-                      ) : (
-                        <div className="overflow-x-auto rounded-xl border border-slate-200">
-                          <table className="min-w-full text-left text-xs">
-                            <thead className="bg-slate-50 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
-                              <tr>
-                                <th className="px-3 py-2">Node</th>
-                                <th className="px-3 py-2">Status</th>
-                                <th className="px-3 py-2">Model</th>
-                                <th className="px-3 py-2">In</th>
-                                <th className="px-3 py-2">Out</th>
-                                <th className="px-3 py-2">$</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {selectedRun.node_executions.map((node: NodeExecution) => (
-                                <tr key={node.id} className="border-t border-slate-200 text-slate-700">
-                                  <td className="px-3 py-2 font-medium text-slate-900">{node.node_name}</td>
-                                  <td className="px-3 py-2">{node.status}</td>
-                                  <td className="px-3 py-2 break-words">
-                                    {node.model_used ?? node.model_profile ?? "-"}
-                                  </td>
-                                  <td className="px-3 py-2">{node.token_input ?? 0}</td>
-                                  <td className="px-3 py-2">{node.token_output ?? 0}</td>
-                                  <td className="px-3 py-2">
-                                    {node.cost_estimate != null ? `$${node.cost_estimate.toFixed(4)}` : "-"}
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      )}
-                    </section>
-                  </>
-                ) : (
-                  <div className="flex h-full min-h-[400px] items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-slate-50 text-sm text-slate-500">
-                    Select a run to see logs.
+              ) : (
+                <div className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-xl font-semibold text-slate-950">Output viewer</h3>
+                      <p className="mt-1 text-sm text-slate-500">
+                        Final Markdown and PDF outputs for the selected run.
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      {(["markdown", "pdf"] as OutputViewer[]).map((viewer) => (
+                        <button
+                          key={viewer}
+                          className={clsx(
+                            "rounded-lg px-3 py-2 text-sm font-semibold",
+                            outputViewer === viewer
+                              ? "bg-slate-900 text-white"
+                              : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+                          )}
+                          onClick={() => setOutputViewer(viewer)}
+                        >
+                          {viewer === "markdown" ? "Markdown" : "PDF"}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                )}
+
+                  {previewError ? (
+                    <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                      {previewError}
+                    </div>
+                  ) : outputViewer === "markdown" ? (
+                    latestMarkdownArtifact ? (
+                      <article className="prose prose-slate max-w-none rounded-2xl border border-slate-200 bg-slate-50 p-6">
+                        <ReactMarkdown>{previewArtifactId === latestMarkdownArtifact.id ? previewText : ""}</ReactMarkdown>
+                      </article>
+                    ) : (
+                      <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                        {selectedRunActive
+                          ? "Output will appear when final files are created."
+                          : "No final markdown for this run."}
+                      </div>
+                    )
+                  ) : latestPdfArtifact ? (
+                    <iframe
+                      className="h-[680px] w-full rounded-2xl border border-slate-200 bg-white"
+                      src={previewArtifactId === latestPdfArtifact.id ? previewUrl : filePreviewPath(latestPdfArtifact.id)}
+                    />
+                  ) : (
+                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                      {selectedRunActive ? "PDF will appear when generated." : "No final PDF for this run."}
+                    </div>
+                  )}
+                </div>
+              )
+            ) : activeTab === "logs" ? (
+              !selectedRun ? (
+                <div className="flex min-h-[520px] items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white px-8 text-center text-sm text-slate-500">
+                  Select a run to inspect logs.
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <h3 className="text-lg font-semibold text-slate-950">Run summary</h3>
+                        <p className="mt-1 text-sm text-slate-500">Status, timestamps, and errors for the selected run.</p>
+                      </div>
+                      <span className={clsx("rounded-full border px-3 py-2 text-xs font-semibold", statusTone(selectedRun.status))}>
+                        {selectedRun.status}
+                      </span>
+                    </div>
+                    <dl className="mt-4 grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:grid-cols-2 xl:grid-cols-4">
+                      <div>
+                        <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Created</dt>
+                        <dd className="mt-1 text-sm text-slate-900">{formatDateTime(selectedRun.created_at)}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Updated</dt>
+                        <dd className="mt-1 text-sm text-slate-900">{formatDateTime(selectedRun.updated_at)}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Completed</dt>
+                        <dd className="mt-1 text-sm text-slate-900">{formatDateTime(selectedRun.completed_at)}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Events</dt>
+                        <dd className="mt-1 text-sm text-slate-900">{selectedRun.events.length}</dd>
+                      </div>
+                    </dl>
+                    {selectedRun.error_message ? (
+                      <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                        {selectedRun.error_message}
+                      </div>
+                    ) : null}
+                  </section>
+
+                  <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <h3 className="text-lg font-semibold text-slate-950">Run events</h3>
+                    {(selectedRun.events ?? []).length === 0 ? (
+                      <div className="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-center text-sm text-slate-500">
+                        No events yet.
+                      </div>
+                    ) : (
+                      <div className="mt-4 space-y-3">
+                        {selectedRun.events.map((event) => (
+                          <article key={event.id} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                            <div className="flex items-center justify-between gap-3">
+                              <p className="text-sm font-semibold text-slate-950">{event.type}</p>
+                              <span className="text-xs text-slate-500">{formatDateTime(event.created_at)}</span>
+                            </div>
+                            <pre className="mt-3 max-h-[180px] overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs leading-5 text-slate-700">
+                              {JSON.stringify(event.event_json, null, 2)}
+                            </pre>
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+
+                  <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <h3 className="text-lg font-semibold text-slate-950">Node executions</h3>
+                    {pipelineNodes.length === 0 ? (
+                      <div className="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-center text-sm text-slate-500">
+                        No node execution records for this run.
+                      </div>
+                    ) : (
+                      <div className="mt-4 overflow-x-auto rounded-2xl border border-slate-200">
+                        <table className="min-w-full text-left text-sm text-slate-700">
+                          <thead className="bg-slate-50 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            <tr>
+                              <th className="px-4 py-3">Node</th>
+                              <th className="px-4 py-3">Status</th>
+                              <th className="px-4 py-3">Model</th>
+                              <th className="px-4 py-3">Input</th>
+                              <th className="px-4 py-3">Output</th>
+                              <th className="px-4 py-3">Cost</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pipelineNodes.map((node: NodeExecution) => (
+                              <tr key={node.id} className="border-t border-slate-200">
+                                <td className="px-4 py-3 font-medium text-slate-950">{node.node_name}</td>
+                                <td className="px-4 py-3">{node.status}</td>
+                                <td className="px-4 py-3 break-words">{node.model_used ?? node.model_profile ?? "-"}</td>
+                                <td className="px-4 py-3">{node.token_input ?? 0}</td>
+                                <td className="px-4 py-3">{node.token_output ?? 0}</td>
+                                <td className="px-4 py-3">{node.cost_estimate != null ? `$${node.cost_estimate.toFixed(4)}` : "-"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </section>
+                </div>
+              )
+            ) : selectedRun ? (
+              <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <h3 className="text-xl font-semibold text-slate-950">Run state</h3>
+                <p className="mt-1 text-sm text-slate-500">The selected run state is available in the Data Inspector tab.</p>
+                <div className="mt-4 overflow-auto rounded-2xl bg-slate-50 p-4">
+                  <JsonView collapsed={1} src={selectedRun.state_json ?? {}} />
+                </div>
               </div>
-            ) : null}
+            ) : (
+              <div className="flex min-h-[520px] items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white px-8 text-center text-sm text-slate-500">
+                No run selected.
+              </div>
+            )}
           </div>
-        </aside>
+        </section>
       </div>
 
       <DeleteProjectModal
@@ -1616,14 +1544,15 @@ export default function WorkspacePage() {
         project={selectedProject}
         onClose={() => setDeleteModalOpen(false)}
         onDeleted={(deletedId) => {
-          setProjects((current) => current.filter((p) => p.id !== deletedId));
+          setProjects((current) => current.filter((project) => project.id !== deletedId));
           if (selectedProjectId === deletedId) {
             setSelectedProjectId("");
             setSelectedRunId("");
             setSelectedRun(null);
-            setMessages([]);
-            setFiles([]);
             setRuns([]);
+            setFiles([]);
+            setMessages([]);
+            resetPreview();
           }
         }}
       />
