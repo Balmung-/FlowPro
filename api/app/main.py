@@ -27,6 +27,7 @@ from app.models import (
     RunEvent,
     Template,
     User,
+    VaultItem,
     generate_id,
     serialize_artifact,
     serialize_chat_message,
@@ -36,6 +37,7 @@ from app.models import (
     serialize_run_event,
     serialize_template,
     serialize_user,
+    serialize_vault_item,
     utcnow,
 )
 from app.services import StorageService, WorkflowService, validate_template_config
@@ -80,6 +82,34 @@ class TemplateUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     config_json: dict | None = None
+
+
+class VaultUploadUrlRequest(BaseModel):
+    name: str
+    mime_type: str
+    folder: str = "/"
+
+
+class VaultConfirmUploadRequest(BaseModel):
+    item_id: str
+    name: str
+    mime_type: str
+    size_bytes: int
+    folder: str = "/"
+    notes: str = ""
+
+
+class VaultFromArtifactRequest(BaseModel):
+    artifact_id: str
+    name: str | None = None
+    folder: str = "/"
+    notes: str = ""
+
+
+class VaultUpdateRequest(BaseModel):
+    name: str | None = None
+    folder: str | None = None
+    notes: str | None = None
 
 
 class MessageCreateRequest(BaseModel):
@@ -376,9 +406,26 @@ async def delete_project(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     project = await get_project_for_user(db, project_id, current_user.id)
+    # Wipe the R2 tree first so we don't leak storage. The DB rows (runs,
+    # node_executions, run_events, chat_messages, artifacts) cascade via FKs
+    # when the project row is deleted.
+    deleted_objects = 0
+    try:
+        deleted_objects = await storage_service.delete_project_tree(project)
+    except Exception as exc:
+        # Don't block deletion of the DB row if the storage cleanup partially fails;
+        # the user can re-run cleanup later. Surface the error in the response.
+        await db.delete(project)
+        await db.commit()
+        return {
+            "deleted": True,
+            "project_id": project_id,
+            "deleted_objects": deleted_objects,
+            "storage_warning": f"Storage cleanup partial: {exc}",
+        }
     await db.delete(project)
     await db.commit()
-    return {"deleted": True, "project_id": project_id}
+    return {"deleted": True, "project_id": project_id, "deleted_objects": deleted_objects}
 
 
 # ---------------------------------------------------------------------------
@@ -822,3 +869,213 @@ async def delete_artifact(
     deleted = await storage_service.delete_file(db, project, artifact.path)
     await db.commit()
     return {"deleted": True, "artifact": serialize_artifact(deleted)}
+
+
+# ---------------------------------------------------------------------------
+# Vault — per-user permanent storage that survives project deletion.
+# Files live at vault/{user_id}/{vault_item_id} in R2; rename/move is a pure
+# DB update because the storage key is opaque.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/vault")
+async def list_vault_items(
+    folder: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    statement = select(VaultItem).where(VaultItem.user_id == current_user.id)
+    if folder:
+        normalized = storage_service.normalize_vault_folder(folder)
+        statement = statement.where(VaultItem.folder == normalized)
+    if search:
+        like = f"%{search.strip()}%"
+        statement = statement.where(VaultItem.name.ilike(like))
+    statement = statement.order_by(desc(VaultItem.created_at))
+    result = await db.execute(statement)
+    return [serialize_vault_item(item) for item in result.scalars().all()]
+
+
+@app.get("/vault/folders")
+async def list_vault_folders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Returns the set of distinct virtual folders this user has used so the
+    UI can render a folder tree."""
+    result = await db.execute(
+        select(VaultItem.folder).where(VaultItem.user_id == current_user.id).distinct()
+    )
+    folders = sorted({row[0] or "/" for row in result.all()})
+    if "/" not in folders:
+        folders.insert(0, "/")
+    return {"folders": folders}
+
+
+@app.post("/vault/upload-url")
+async def vault_upload_url(
+    payload: VaultUploadUrlRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Reserve a vault item id, return a presigned PUT URL keyed by that id."""
+    item_id = generate_id("vlt")
+    storage_key = storage_service.vault_storage_key(current_user.id, item_id)
+    upload_url = await storage_service.get_vault_signed_upload_url(storage_key, payload.mime_type)
+    return {
+        "upload_url": upload_url,
+        "item_id": item_id,
+        "storage_key": storage_key,
+    }
+
+
+@app.post("/vault/confirm-upload")
+async def vault_confirm_upload(
+    payload: VaultConfirmUploadRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    storage_key = storage_service.vault_storage_key(current_user.id, payload.item_id)
+    try:
+        metadata = await storage_service.get_vault_object_metadata(storage_key)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Uploaded vault object not found in R2: {exc}"
+        ) from exc
+
+    folder = storage_service.normalize_vault_folder(payload.folder)
+    item = VaultItem(
+        id=payload.item_id,
+        user_id=current_user.id,
+        name=payload.name.strip() or "untitled",
+        folder=folder,
+        storage_key=storage_key,
+        mime_type=payload.mime_type,
+        size_bytes=int(metadata.get("ContentLength", payload.size_bytes)),
+        notes=payload.notes,
+    )
+    db.add(item)
+    await db.commit()
+    return serialize_vault_item(item)
+
+
+@app.post("/vault/from-artifact")
+async def vault_from_artifact(
+    payload: VaultFromArtifactRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Server-side copy a project artifact into the user's vault."""
+    artifact = await db.get(Artifact, payload.artifact_id)
+    if not artifact or artifact.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+    project = await get_project_for_user(db, artifact.project_id, current_user.id)
+
+    item_id = generate_id("vlt")
+    storage_key = storage_service.vault_storage_key(current_user.id, item_id)
+    size = await storage_service.copy_artifact_to_vault(project, artifact, storage_key)
+
+    item = VaultItem(
+        id=item_id,
+        user_id=current_user.id,
+        name=(payload.name or artifact.filename).strip() or artifact.filename,
+        folder=storage_service.normalize_vault_folder(payload.folder),
+        storage_key=storage_key,
+        mime_type=artifact.mime_type,
+        size_bytes=size,
+        source_project_id=artifact.project_id,
+        source_run_id=artifact.run_id,
+        source_artifact_id=artifact.id,
+        notes=payload.notes,
+    )
+    db.add(item)
+    await db.commit()
+    return serialize_vault_item(item)
+
+
+@app.get("/vault/{item_id}")
+async def get_vault_item(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    item = await db.get(VaultItem, item_id)
+    if not item or item.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Vault item not found.")
+    return serialize_vault_item(item)
+
+
+@app.get("/vault/{item_id}/download-url")
+async def vault_download_url(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    item = await db.get(VaultItem, item_id)
+    if not item or item.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Vault item not found.")
+    url = await storage_service.get_vault_signed_download_url(item.storage_key)
+    return {"download_url": url}
+
+
+@app.get("/vault/{item_id}/content")
+async def vault_content(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    item = await db.get(VaultItem, item_id)
+    if not item or item.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Vault item not found.")
+    content = await storage_service.read_vault_object(item.storage_key)
+    return Response(
+        content=content,
+        media_type=item.mime_type,
+        headers={"Content-Disposition": f'inline; filename="{item.name}"'},
+    )
+
+
+@app.patch("/vault/{item_id}")
+async def update_vault_item(
+    item_id: str,
+    payload: VaultUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    item = await db.get(VaultItem, item_id)
+    if not item or item.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Vault item not found.")
+    if payload.name is not None:
+        cleaned = payload.name.strip()
+        if not cleaned:
+            raise HTTPException(status_code=400, detail="Name cannot be empty.")
+        item.name = cleaned
+    if payload.folder is not None:
+        item.folder = storage_service.normalize_vault_folder(payload.folder)
+    if payload.notes is not None:
+        item.notes = payload.notes
+    item.updated_at = utcnow()
+    await db.commit()
+    return serialize_vault_item(item)
+
+
+@app.delete("/vault/{item_id}")
+async def delete_vault_item(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    item = await db.get(VaultItem, item_id)
+    if not item or item.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Vault item not found.")
+    try:
+        await storage_service.delete_vault_object(item.storage_key)
+    except Exception as exc:
+        # Don't block DB cleanup if R2 delete fails (object may already be gone).
+        await db.delete(item)
+        await db.commit()
+        return {"deleted": True, "item_id": item_id, "storage_warning": str(exc)}
+    await db.delete(item)
+    await db.commit()
+    return {"deleted": True, "item_id": item_id}

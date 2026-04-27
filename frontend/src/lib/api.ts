@@ -70,6 +70,26 @@ export type OpenRouterModelsResponse = {
   stale?: boolean;
 };
 
+export type VaultItem = {
+  id: string;
+  user_id: string;
+  name: string;
+  folder: string;
+  storage_key: string;
+  mime_type: string;
+  size_bytes: number;
+  source_project_id: string | null;
+  source_run_id: string | null;
+  source_artifact_id: string | null;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type VaultFoldersResponse = {
+  folders: string[];
+};
+
 export type TemplateConfig = {
   name: string;
   description?: string;

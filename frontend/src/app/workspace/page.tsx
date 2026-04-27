@@ -26,6 +26,7 @@ import {
   apiFetch,
 } from "@/lib/api";
 import { clearAuthSession, getStoredToken } from "@/lib/auth";
+import FileExplorerDrawer from "@/components/file-explorer-drawer";
 
 const STREAM_EVENT_TYPES = [
   "run.started",
@@ -121,6 +122,8 @@ export default function WorkspacePage() {
   const [isUploadingFiles, setIsUploadingFiles] = useState(false);
   const [isStartingRun, setIsStartingRun] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [explorerOpen, setExplorerOpen] = useState(false);
+  const [explorerInitialTab, setExplorerInitialTab] = useState<"project" | "vault">("project");
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -616,6 +619,28 @@ export default function WorkspacePage() {
     }
   }
 
+  async function handleSaveToVault(artifact: Artifact) {
+    setError(null);
+    const folder = window.prompt("Save to vault folder (e.g. /Proposals or just /)", "/");
+    if (folder === null) return;
+    try {
+      await apiFetch("/vault/from-artifact", {
+        method: "POST",
+        body: JSON.stringify({
+          artifact_id: artifact.id,
+          name: artifact.filename,
+          folder: folder.trim() || "/",
+          notes: selectedProject ? `From project ${selectedProject.name} · ${artifact.path}` : "",
+        }),
+      });
+      // Briefly open the explorer on the vault tab so the user sees it landed.
+      setExplorerInitialTab("vault");
+      setExplorerOpen(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Save to vault failed.");
+    }
+  }
+
   function handleSignOut() {
     clearAuthSession();
     eventSourceRef.current?.close();
@@ -644,7 +669,7 @@ export default function WorkspacePage() {
             </button>
           </div>
 
-          <div className="border-b border-slate-200 px-5 py-4">
+          <div className="space-y-2 border-b border-slate-200 px-5 py-4">
             <Link
               className="flex items-center justify-between rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm font-semibold text-blue-900 shadow-sm hover:bg-blue-100"
               href="/templates"
@@ -657,8 +682,25 @@ export default function WorkspacePage() {
                 {templates.length}
               </span>
             </Link>
-            <p className="mt-2 text-[10px] leading-tight text-slate-500">
-              Build the node graph for each template here. Each project picks one.
+            <button
+              type="button"
+              className="flex w-full items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-900 shadow-sm hover:bg-emerald-100"
+              onClick={() => {
+                setExplorerInitialTab("project");
+                setExplorerOpen(true);
+              }}
+            >
+              <span className="flex items-center gap-2">
+                <span aria-hidden>📁</span>
+                Files &amp; Vault
+              </span>
+              <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-emerald-700">
+                Open
+              </span>
+            </button>
+            <p className="text-[10px] leading-tight text-slate-500">
+              Browse this project's files. Save anything to your permanent Vault before deleting the
+              project.
             </p>
           </div>
 
@@ -1148,6 +1190,13 @@ export default function WorkspacePage() {
                                   Copy path
                                 </button>
                                 <button
+                                  className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-800 hover:bg-emerald-100"
+                                  onClick={() => void handleSaveToVault(artifact)}
+                                  title="Copy this file into your permanent Vault"
+                                >
+                                  Save to Vault
+                                </button>
+                                <button
                                   className="rounded-md border border-red-200 px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50"
                                   onClick={() => void handleDelete(artifact)}
                                 >
@@ -1361,6 +1410,18 @@ export default function WorkspacePage() {
           </div>
         </aside>
       </div>
+
+      <FileExplorerDrawer
+        open={explorerOpen}
+        onClose={() => setExplorerOpen(false)}
+        initialTab={explorerInitialTab}
+        project={selectedProject}
+        onProjectFilesChanged={() => {
+          if (selectedProjectId) {
+            void loadProjectData(selectedProjectId, selectedRunId || undefined);
+          }
+        }}
+      />
     </main>
   );
 }

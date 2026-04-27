@@ -322,6 +322,40 @@ class StorageService:
         files.sort(key=lambda artifact: artifact.created_at, reverse=True)
         return files
 
+    async def delete_project_tree(self, project: Project) -> int:
+        """List + batch-delete every R2 object under the project's root prefix.
+        Used when a project is deleted so we don't leak files. Returns count deleted.
+
+        Cloudflare R2 supports the S3 DeleteObjects batch op (up to 1000 keys per call).
+        """
+        prefix = f"{project.r2_root_prefix.rstrip('/')}/"
+        deleted = 0
+        continuation_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "Bucket": settings.cloudflare_r2_bucket,
+                "Prefix": prefix,
+                "MaxKeys": 1000,
+            }
+            if continuation_token:
+                params["ContinuationToken"] = continuation_token
+            response = await self._run_s3("list_objects_v2", **params)
+            objects = response.get("Contents", []) or []
+            if objects:
+                keys = [{"Key": item["Key"]} for item in objects if item.get("Key")]
+                if keys:
+                    await self._run_s3(
+                        "delete_objects",
+                        Bucket=settings.cloudflare_r2_bucket,
+                        Delete={"Objects": keys, "Quiet": True},
+                    )
+                    deleted += len(keys)
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+        logger.info("Deleted %d R2 objects for project %s", deleted, project.id)
+        return deleted
+
     async def delete_file(self, db: AsyncSession, project: Project, relative_path: str) -> Artifact:
         safe_path = self.validate_relative_path(relative_path)
         result = await db.execute(
@@ -391,6 +425,93 @@ class StorageService:
             Bucket=settings.cloudflare_r2_bucket,
             MaxKeys=1,
         )
+
+    # ---------- Vault helpers ----------
+
+    @staticmethod
+    def vault_storage_key(user_id: str, vault_item_id: str) -> str:
+        return f"vault/{user_id}/{vault_item_id}"
+
+    @staticmethod
+    def normalize_vault_folder(folder: str | None) -> str:
+        if not folder:
+            return "/"
+        cleaned = folder.replace("\\", "/").strip()
+        if not cleaned.startswith("/"):
+            cleaned = "/" + cleaned
+        # collapse duplicate slashes and reject path traversal
+        parts = [p for p in cleaned.split("/") if p and p != "."]
+        for part in parts:
+            if part == "..":
+                raise HTTPException(status_code=400, detail="Folder path cannot contain '..'.")
+        normalized = "/" + "/".join(parts) if parts else "/"
+        return normalized
+
+    async def get_vault_signed_upload_url(self, storage_key: str, mime_type: str) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.client.generate_presigned_url(
+                "put_object",
+                Params={
+                    "Bucket": settings.cloudflare_r2_bucket,
+                    "Key": storage_key,
+                    "ContentType": mime_type,
+                },
+                ExpiresIn=3600,
+            ),
+        )
+
+    async def get_vault_signed_download_url(self, storage_key: str) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.cloudflare_r2_bucket, "Key": storage_key},
+                ExpiresIn=3600,
+            ),
+        )
+
+    async def get_vault_object_metadata(self, storage_key: str) -> dict[str, Any]:
+        return await self._run_s3(
+            "head_object",
+            Bucket=settings.cloudflare_r2_bucket,
+            Key=storage_key,
+        )
+
+    async def read_vault_object(self, storage_key: str) -> bytes:
+        response = await self._run_s3(
+            "get_object",
+            Bucket=settings.cloudflare_r2_bucket,
+            Key=storage_key,
+        )
+        return response["Body"].read()
+
+    async def delete_vault_object(self, storage_key: str) -> None:
+        await self._run_s3(
+            "delete_object",
+            Bucket=settings.cloudflare_r2_bucket,
+            Key=storage_key,
+        )
+
+    async def copy_artifact_to_vault(
+        self, project: Project, artifact: Artifact, vault_storage_key: str
+    ) -> int:
+        """Server-side copy an artifact's R2 object into the vault key.
+        Returns the size of the copied object in bytes.
+        """
+        source_key = self.build_object_key(project, artifact.path)
+        await self._run_s3(
+            "copy_object",
+            Bucket=settings.cloudflare_r2_bucket,
+            CopySource={"Bucket": settings.cloudflare_r2_bucket, "Key": source_key},
+            Key=vault_storage_key,
+            ContentType=artifact.mime_type,
+            MetadataDirective="REPLACE",
+        )
+        head = await self.get_vault_object_metadata(vault_storage_key)
+        return int(head.get("ContentLength", artifact.size_bytes))
 
     async def create_artifact_record(
         self,

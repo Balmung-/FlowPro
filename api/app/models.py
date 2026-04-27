@@ -131,6 +131,30 @@ class RunEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class VaultItem(Base):
+    """Permanent per-user file storage. Survives project deletion.
+
+    R2 layout: ``vault/{user_id}/{vault_item_id}`` — keyed by opaque id so
+    rename/move is a pure DB update, no R2 copy.
+    """
+
+    __tablename__ = "vault_items"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(512))
+    folder: Mapped[str] = mapped_column(String(512), default="/")
+    storage_key: Mapped[str] = mapped_column(String(1024), unique=True)
+    mime_type: Mapped[str] = mapped_column(String(255))
+    size_bytes: Mapped[int] = mapped_column()
+    source_project_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_artifact_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 def serialize_user(user: User) -> dict[str, Any]:
     return {"id": user.id, "email": user.email, "name": user.name, "created_at": iso(user.created_at)}
 
@@ -230,5 +254,23 @@ def serialize_run_event(event: RunEvent) -> dict[str, Any]:
         "type": event.event_type,
         "event_json": event.event_json or {},
         "created_at": iso(event.created_at),
+    }
+
+
+def serialize_vault_item(item: VaultItem) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "user_id": item.user_id,
+        "name": item.name,
+        "folder": item.folder,
+        "storage_key": item.storage_key,
+        "mime_type": item.mime_type,
+        "size_bytes": item.size_bytes,
+        "source_project_id": item.source_project_id,
+        "source_run_id": item.source_run_id,
+        "source_artifact_id": item.source_artifact_id,
+        "notes": item.notes,
+        "created_at": iso(item.created_at),
+        "updated_at": iso(item.updated_at),
     }
 
