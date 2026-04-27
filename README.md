@@ -18,11 +18,19 @@ Use one Railway project with five services:
 4. `postgres`
 5. `redis`
 
-For the three code services, point each service at the repository root and set a service-specific `RAILWAY_DOCKERFILE_PATH`:
+For the three code services, point each service at the repository root and set the service's config file path so Railway uses the checked-in deployment settings:
 
-1. `frontend` -> `frontend/Dockerfile`
-2. `api` -> `api/Dockerfile`
-3. `worker` -> `worker/Dockerfile`
+1. `frontend` -> `/frontend/railway.toml`
+2. `api` -> `/api/railway.toml`
+3. `worker` -> `/worker/railway.toml`
+
+Those files already define:
+
+1. `builder = "DOCKERFILE"`
+2. the correct Dockerfile path
+3. watch patterns
+4. healthcheck path where applicable
+5. restart policy
 
 Recommended watch paths:
 
@@ -30,11 +38,7 @@ Recommended watch paths:
 2. `api` -> `/api/**`
 3. `worker` -> `/api/**` and `/worker/**`
 
-Recommended health checks:
-
-1. `frontend` -> `/health`
-2. `api` -> `/health`
-3. `worker` -> none
+If you prefer variables instead of config-as-code for Dockerfile selection, Railway also supports `RAILWAY_DOCKERFILE_PATH`, but the checked-in `railway.toml` files are the intended path for this repo.
 
 ## Required Railway environment variables
 
@@ -99,6 +103,19 @@ API:
 Frontend:
 
 - `GET /health`
+
+## Railway service settings that still must be selected once
+
+Railway cannot infer three different monorepo services from one repo without one service-level selection per service. The required one-time settings are:
+
+1. Create the `frontend`, `api`, and `worker` services in the Railway project.
+2. Connect each service to this GitHub repo.
+3. In each service, set the Config as Code path:
+   - `frontend`: `/frontend/railway.toml`
+   - `api`: `/api/railway.toml`
+   - `worker`: `/worker/railway.toml`
+
+After that, pushes to `main` will use the repo-defined builder, Dockerfile path, healthcheck path, and watch patterns.
 
 ## Railway test path
 
