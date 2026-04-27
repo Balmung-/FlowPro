@@ -76,9 +76,25 @@ def validate_template_config(config: dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail=f"Node {node_id} has unsupported type: {node_type}")
 
         if node_type in ("ai", "plan"):
+            # Either a direct OpenRouter model id (preferred) OR a legacy model_profile slug.
+            model = node.get("model")
             model_profile = node.get("model_profile")
-            if model_profile not in settings.model_profiles:
-                raise HTTPException(status_code=400, detail=f"Node {node_id} has unknown model_profile: {model_profile}")
+            if model:
+                if not isinstance(model, str) or not model.strip():
+                    raise HTTPException(
+                        status_code=400, detail=f"Node {node_id} model must be a non-empty string."
+                    )
+            elif model_profile:
+                if model_profile not in settings.model_profiles:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Node {node_id} has unknown model_profile: {model_profile}",
+                    )
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Node {node_id} must specify either 'model' (OpenRouter id) or 'model_profile'.",
+                )
 
         output = node.get("output")
         if not isinstance(output, dict):
@@ -439,16 +455,29 @@ class OpenRouterService:
                 stripped = stripped.lstrip()[4:]
         return json.loads(stripped.strip())
 
+    def _resolve_models(self, *, model: str | None, model_profile: str | None) -> list[str]:
+        """Resolve the ordered list of model IDs to try.
+
+        - If `model` is set, use [model] directly (no automatic fallback).
+        - Else use settings.model_profiles[model_profile] (primary, fallback).
+        """
+        if model:
+            return [model]
+        if model_profile and model_profile in settings.model_profiles:
+            return list(settings.model_profiles[model_profile])
+        raise RuntimeError("Neither model nor a valid model_profile was provided.")
+
     async def _run_completion(
         self,
         *,
-        model_profile: str,
+        model: str | None,
+        model_profile: str | None,
         system_prompt: str,
         user_prompt: str,
         expect_json: bool,
     ) -> dict[str, Any]:
         last_error: Exception | None = None
-        for model_name in settings.model_profiles[model_profile]:
+        for model_name in self._resolve_models(model=model, model_profile=model_profile):
             payload: dict[str, Any] = {
                 "model": model_name,
                 "messages": [
@@ -476,18 +505,35 @@ class OpenRouterService:
                 }
             except Exception as exc:
                 last_error = exc
-        raise RuntimeError(f"OpenRouter completion failed for profile {model_profile}: {last_error}")
+        target = model or model_profile or "(unknown)"
+        raise RuntimeError(f"OpenRouter completion failed for {target}: {last_error}")
 
-    async def run_chat_completion(self, *, model_profile: str, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    async def run_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        model_profile: str | None = None,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
         return await self._run_completion(
+            model=model,
             model_profile=model_profile,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             expect_json=False,
         )
 
-    async def run_json_completion(self, *, model_profile: str, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    async def run_json_completion(
+        self,
+        *,
+        model: str | None = None,
+        model_profile: str | None = None,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
         return await self._run_completion(
+            model=model,
             model_profile=model_profile,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -624,7 +670,8 @@ class WorkflowService:
                     node_name=node["name"],
                     node_type=node["type"],
                     status="waiting",
-                    model_profile=node.get("model_profile"),
+                    # Direct model id takes precedence; falls back to profile slug for legacy configs.
+                    model_profile=node.get("model") or node.get("model_profile"),
                     input_json={},
                     output_json={},
                 )
@@ -753,12 +800,15 @@ class WorkflowService:
         output_format = node_config["output"]["format"]
         expect_json = output_format == "json"
 
+        node_model = node_config.get("model")
+        node_profile = node_config.get("model_profile")
         node_row.input_json = {
             "message": message,
             "reads": node_config.get("reads", []),
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
-            "model_profile": node_config.get("model_profile"),
+            "model": node_model,
+            "model_profile": node_profile,
         }
         await self.emit_event(db, run.id, "node.started", {"run_id": run.id, "node_id": node_config["id"]})
         await db.commit()
@@ -768,13 +818,15 @@ class WorkflowService:
                 result = self._mock_node_result(node_config, sub_context)
             elif expect_json:
                 result = await self.openrouter.run_json_completion(
-                    model_profile=node_config["model_profile"],
+                    model=node_model,
+                    model_profile=node_profile,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                 )
             else:
                 result = await self.openrouter.run_chat_completion(
-                    model_profile=node_config["model_profile"],
+                    model=node_model,
+                    model_profile=node_profile,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                 )

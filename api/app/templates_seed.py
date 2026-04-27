@@ -8,7 +8,9 @@ Node config schema (linear v1):
         "id": str,                # unique within template
         "name": str,
         "type": "ai" | "plan" | "pdf_generator",
-        "model_profile": str | None,   # required for ai/plan, ignored for pdf_generator
+        # AI/plan nodes need either `model` (preferred) or `model_profile` (legacy):
+        "model": str | None,           # direct OpenRouter model id, e.g. "anthropic/claude-3.5-sonnet"
+        "model_profile": str | None,   # legacy fallback bundle; resolves to settings.model_profiles[slug]
         "system_prompt": str,          # for ai/plan only
         "user_prompt_template": str,   # uses ${var} substitutions, for ai/plan only
         "reads": [str],                # state references like "working.intent" — value injected as ${working_intent}
@@ -42,7 +44,7 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "id": "intent_parser",
             "name": "Intent Parser",
             "type": "ai",
-            "model_profile": "fast_classifier",
+            "model": "openai/gpt-4o-mini",
             "system_prompt": "Extract the user's document-generation intent into the required JSON shape. Always return the requested keys.",
             "user_prompt_template": "User message:\n${message}\n\nUploaded files:\n${uploaded_files}\n\nReturn JSON with keys: document_type, target_audience, goal, tone, requested_outputs, missing_information.",
             "reads": [],
@@ -65,7 +67,7 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "id": "requirement_extractor",
             "name": "Requirement Extractor",
             "type": "ai",
-            "model_profile": "json_extractor",
+            "model": "openai/gpt-4.1-mini",
             "system_prompt": "Extract concrete requirements, constraints, must_include, must_avoid, and source_notes. Return only valid JSON.",
             "user_prompt_template": "User message:\n${message}\n\nUploaded files:\n${uploaded_files}\n\nIntent JSON:\n${working_intent}",
             "reads": ["working.intent"],
@@ -102,7 +104,7 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "id": "outline_builder",
             "name": "Outline Builder",
             "type": "ai",
-            "model_profile": "premium_writer",
+            "model": "anthropic/claude-3.5-sonnet",
             "system_prompt": "Write a strong markdown outline for the requested document. Use structure, headings, and bullets. Do not write the full document.",
             "user_prompt_template": "User message:\n${message}\n\nIntent JSON:\n${working_intent}\n\nRequirements JSON:\n${working_requirements}",
             "reads": ["working.intent", "working.requirements"],
@@ -118,7 +120,7 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "id": "draft_writer",
             "name": "Draft Writer",
             "type": "ai",
-            "model_profile": "premium_writer",
+            "model": "anthropic/claude-3.5-sonnet",
             "system_prompt": "Write the complete markdown draft using the outline and every extracted requirement.",
             "user_prompt_template": "User message:\n${message}\n\nIntent JSON:\n${working_intent}\n\nRequirements JSON:\n${working_requirements}\n\nOutline Markdown:\n${working_outline}",
             "reads": ["working.intent", "working.requirements", "working.outline"],
@@ -134,7 +136,7 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "id": "critic_qa",
             "name": "Critic QA",
             "type": "ai",
-            "model_profile": "deep_reasoner",
+            "model": "openai/o3-mini",
             "system_prompt": "Audit the draft against the requirements. Return JSON with overall_score, issues, recommended_fixes, and final_instruction.",
             "user_prompt_template": "User message:\n${message}\n\nRequirements JSON:\n${working_requirements}\n\nDraft Markdown:\n${working_draft}",
             "reads": ["working.requirements", "working.draft"],
@@ -160,7 +162,7 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "id": "final_writer",
             "name": "Final Writer",
             "type": "ai",
-            "model_profile": "premium_writer",
+            "model": "anthropic/claude-3.5-sonnet",
             "system_prompt": "Revise the draft into the final markdown document. Apply the QA recommendations and final instruction. Produce only markdown.",
             "user_prompt_template": "User message:\n${message}\n\nRequirements JSON:\n${working_requirements}\n\nDraft Markdown:\n${working_draft}\n\nQA Report JSON:\n${working_qa_report}",
             "reads": ["working.requirements", "working.draft", "working.qa_report"],
@@ -196,7 +198,7 @@ def _plan_node() -> dict[str, Any]:
         "id": "plan",
         "name": "Plan",
         "type": "plan",
-        "model_profile": "deep_reasoner",
+        "model": "openai/o3-mini",
         "system_prompt": "You are the planning node. Produce a concise plantodo.md before any execution node acts. Cover Goal, Current Understanding, Files Likely Involved, Structural Decision, Execution Steps, Risks, What Not To Do, and Completion Criteria. Markdown only.",
         "user_prompt_template": "User request:\n${message}\n\nUploaded files:\n${uploaded_files}\n\nWrite the plantodo.md document.",
         "reads": [],

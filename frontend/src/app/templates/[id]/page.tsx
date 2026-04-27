@@ -5,13 +5,15 @@ import "reactflow/dist/style.css";
 import Link from "next/link";
 import clsx from "clsx";
 import ReactFlow, { Background, Controls, Edge, MarkerType, Node } from "reactflow";
-import { ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 
 import {
   ModelProfile,
   ModelProfilesResponse,
   NodeOutputFormat,
+  OpenRouterModel,
+  OpenRouterModelsResponse,
   Template,
   TemplateConfig,
   TemplateNodeConfig,
@@ -20,20 +22,6 @@ import {
   apiFetch,
 } from "@/lib/api";
 import { getStoredToken } from "@/lib/auth";
-
-const PROFILE_LABELS: Record<string, string> = {
-  fast_classifier: "Fast Classifier",
-  json_extractor: "JSON Extractor",
-  premium_writer: "Premium Writer",
-  deep_reasoner: "Deep Reasoner",
-};
-
-const PROFILE_DESCRIPTIONS: Record<string, string> = {
-  fast_classifier: "Cheap, fast model for routing/classification tasks.",
-  json_extractor: "Strong at producing structured JSON output.",
-  premium_writer: "Top-tier writing model for outlines, drafts, final polish.",
-  deep_reasoner: "Reasoning-heavy model for QA, planning, and judgment calls.",
-};
 
 const ALL_VIEWERS: ViewerKind[] = ["markdown", "pdf", "json", "raw"];
 
@@ -59,7 +47,7 @@ function defaultNode(type: TemplateNodeType, existingIds: Set<string>): Template
       id,
       name: "Plan",
       type: "plan",
-      model_profile: "deep_reasoner",
+      model: "openai/o3-mini",
       system_prompt:
         "You are the planning node. Produce a concise plantodo.md before any execution node acts.",
       user_prompt_template: "User request:\n${message}\n\nUploaded files:\n${uploaded_files}",
@@ -78,7 +66,6 @@ function defaultNode(type: TemplateNodeType, existingIds: Set<string>): Template
       id,
       name: "PDF Generator",
       type: "pdf_generator",
-      model_profile: null,
       system_prompt: "",
       user_prompt_template: "",
       reads: [],
@@ -96,7 +83,7 @@ function defaultNode(type: TemplateNodeType, existingIds: Set<string>): Template
     id: baseId,
     name: "New AI Node",
     type: "ai",
-    model_profile: "premium_writer",
+    model: "anthropic/claude-3.5-sonnet",
     system_prompt: "",
     user_prompt_template: "User message:\n${message}",
     reads: [],
@@ -132,6 +119,7 @@ export default function TemplateBuilderPage() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
+  const [openRouterModels, setOpenRouterModels] = useState<OpenRouterModel[]>([]);
 
   const isSeeded = template?.is_seeded === true;
   const readOnly = isSeeded;
@@ -144,6 +132,9 @@ export default function TemplateBuilderPage() {
     }
     apiFetch<ModelProfilesResponse>("/model-profiles")
       .then((res) => setModelProfiles(res.profiles))
+      .catch(() => undefined);
+    apiFetch<OpenRouterModelsResponse>("/openrouter-models")
+      .then((res) => setOpenRouterModels(res.data ?? []))
       .catch(() => undefined);
 
     if (isNew) {
@@ -470,6 +461,7 @@ export default function TemplateBuilderPage() {
               node={selectedNode}
               upstreamReadOptions={upstreamReadOptions}
               modelProfiles={modelProfiles}
+              openRouterModels={openRouterModels}
               readOnly={readOnly}
               isFirst={config.nodes[0]?.id === selectedNode.id}
               isLast={config.nodes[config.nodes.length - 1]?.id === selectedNode.id}
@@ -564,6 +556,7 @@ function NodePropertiesPanel({
   node,
   upstreamReadOptions,
   modelProfiles,
+  openRouterModels,
   readOnly,
   isFirst,
   isLast,
@@ -576,6 +569,7 @@ function NodePropertiesPanel({
   node: TemplateNodeConfig;
   upstreamReadOptions: string[];
   modelProfiles: ModelProfile[];
+  openRouterModels: OpenRouterModel[];
   readOnly: boolean;
   isFirst: boolean;
   isLast: boolean;
@@ -595,15 +589,20 @@ function NodePropertiesPanel({
     onChange({ reads: Array.from(next) });
   };
 
-  const profileFallback: ModelProfile[] = modelProfiles.length
-    ? modelProfiles
-    : [
-        { slug: "fast_classifier", primary: null, fallback: null },
-        { slug: "json_extractor", primary: null, fallback: null },
-        { slug: "premium_writer", primary: null, fallback: null },
-        { slug: "deep_reasoner", primary: null, fallback: null },
-      ];
-  const activeProfile = profileFallback.find((p) => p.slug === node.model_profile);
+  // Resolve the displayed model id: direct `model` wins, else look up the profile's primary.
+  const profileMap = useMemo(
+    () => new Map(modelProfiles.map((p) => [p.slug, p])),
+    [modelProfiles]
+  );
+  const effectiveModelId = useMemo<string>(() => {
+    if (node.model) return node.model;
+    if (node.model_profile) {
+      const profile = profileMap.get(node.model_profile);
+      if (profile?.primary) return profile.primary;
+      return node.model_profile;
+    }
+    return "";
+  }, [node.model, node.model_profile, profileMap]);
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -663,28 +662,17 @@ function NodePropertiesPanel({
           <>
             <Field
               label="OpenRouter model"
-              hint={
-                activeProfile?.primary
-                  ? `Currently uses ${activeProfile.primary}${activeProfile.fallback ? ` (falls back to ${activeProfile.fallback})` : ""}. Pick the profile best suited to this node's task.`
-                  : "Pick the model profile best suited for this node's task."
-              }
+              hint="Pick any OpenRouter model. Search by provider/name (e.g. 'sonnet', 'gpt-4o', 'gemini'). Pricing shown is per million tokens."
             >
-              <select
-                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-                value={node.model_profile ?? ""}
+              <ModelPicker
+                value={effectiveModelId}
+                models={openRouterModels}
                 disabled={readOnly}
-                onChange={(event) => onChange({ model_profile: event.target.value })}
-              >
-                {profileFallback.map((p) => (
-                  <option key={p.slug} value={p.slug}>
-                    {PROFILE_LABELS[p.slug] ?? p.slug}
-                    {p.primary ? ` — ${p.primary}` : ""}
-                  </option>
-                ))}
-              </select>
-              {activeProfile && PROFILE_DESCRIPTIONS[activeProfile.slug] ? (
+                onChange={(modelId) => onChange({ model: modelId, model_profile: null })}
+              />
+              {!openRouterModels.length ? (
                 <p className="mt-1 text-[10px] italic text-slate-400">
-                  {PROFILE_DESCRIPTIONS[activeProfile.slug]}
+                  Loading the OpenRouter catalog… you can still type any model id manually.
                 </p>
               ) : null}
             </Field>
@@ -837,3 +825,171 @@ function Field({
     </div>
   );
 }
+
+function formatPricing(model: OpenRouterModel): string | null {
+  const prompt = model.pricing?.prompt;
+  const completion = model.pricing?.completion;
+  if (!prompt && !completion) return null;
+  const fmt = (raw: string | undefined) => {
+    if (!raw) return "?";
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num <= 0) return "free";
+    const perMillion = num * 1_000_000;
+    return `$${perMillion < 1 ? perMillion.toFixed(2) : perMillion.toFixed(2)}/M`;
+  };
+  return `${fmt(prompt)} in · ${fmt(completion)} out`;
+}
+
+function ModelPicker({
+  value,
+  models,
+  disabled,
+  onChange,
+}: {
+  value: string;
+  models: OpenRouterModel[];
+  disabled?: boolean;
+  onChange: (modelId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  // Close on outside click.
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!wrapRef.current || !target) return;
+      if (!wrapRef.current.contains(target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [open]);
+
+  const filtered = useMemo<OpenRouterModel[]>(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return models.slice(0, 50);
+    return models
+      .filter((m) => {
+        const haystack = `${m.id} ${m.name ?? ""} ${m.description ?? ""}`.toLowerCase();
+        return q.split(/\s+/).every((token) => haystack.includes(token));
+      })
+      .slice(0, 100);
+  }, [models, query]);
+
+  const selectedModel = useMemo(
+    () => models.find((m) => m.id === value) ?? null,
+    [models, value]
+  );
+  const selectedLabel = selectedModel?.name
+    ? `${selectedModel.name} (${selectedModel.id})`
+    : value || "Pick a model";
+
+  return (
+    <div className="relative" ref={wrapRef}>
+      <button
+        type="button"
+        className="flex w-full items-center justify-between rounded-lg border border-slate-300 bg-white px-3 py-2 text-left text-sm hover:bg-slate-50 disabled:opacity-60"
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="truncate">{selectedLabel}</span>
+        <span aria-hidden className="ml-2 text-slate-400">
+          ▾
+        </span>
+      </button>
+      {open ? (
+        <div className="absolute z-20 mt-1 w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg">
+          <div className="border-b border-slate-100 p-2">
+            <input
+              autoFocus
+              type="text"
+              className="w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-sm outline-none focus:border-slate-400"
+              placeholder={`Search ${models.length || ""} models…`}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+            <p className="mt-1 px-1 text-[10px] text-slate-400">
+              Or type a custom model id below and press Enter to use it.
+            </p>
+            {query && !filtered.find((m) => m.id === query) ? (
+              <button
+                type="button"
+                className="mt-1 w-full rounded-md border border-dashed border-slate-300 bg-slate-50 px-2 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-100"
+                onClick={() => {
+                  onChange(query.trim());
+                  setOpen(false);
+                  setQuery("");
+                }}
+              >
+                Use custom: <span className="font-mono">{query.trim()}</span>
+              </button>
+            ) : null}
+          </div>
+          <ul className="max-h-72 overflow-y-auto py-1">
+            {filtered.length === 0 ? (
+              <li className="px-3 py-3 text-xs text-slate-500">No models match.</li>
+            ) : (
+              filtered.map((model) => {
+                const pricing = formatPricing(model);
+                const isActive = model.id === value;
+                return (
+                  <li key={model.id}>
+                    <button
+                      type="button"
+                      className={clsx(
+                        "block w-full px-3 py-2 text-left text-sm transition",
+                        isActive ? "bg-slate-900 text-white" : "hover:bg-slate-50 text-slate-800"
+                      )}
+                      onClick={() => {
+                        onChange(model.id);
+                        setOpen(false);
+                        setQuery("");
+                      }}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="truncate font-medium">
+                          {model.name || model.id}
+                        </span>
+                        {model.context_length ? (
+                          <span
+                            className={clsx(
+                              "shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold",
+                              isActive ? "bg-white/20" : "bg-slate-100 text-slate-600"
+                            )}
+                          >
+                            {Math.round(model.context_length / 1000)}k ctx
+                          </span>
+                        ) : null}
+                      </div>
+                      <div
+                        className={clsx(
+                          "truncate font-mono text-[10px]",
+                          isActive ? "text-white/70" : "text-slate-500"
+                        )}
+                      >
+                        {model.id}
+                      </div>
+                      {pricing ? (
+                        <div
+                          className={clsx(
+                            "text-[10px]",
+                            isActive ? "text-white/70" : "text-slate-500"
+                          )}
+                        >
+                          {pricing}
+                        </div>
+                      ) : null}
+                    </button>
+                  </li>
+                );
+              })
+            )}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+

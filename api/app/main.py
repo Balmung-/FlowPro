@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Literal
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -181,6 +183,43 @@ async def list_model_profiles(current_user: User = Depends(get_current_user)) ->
             for slug, models in settings.model_profiles.items()
         ]
     }
+
+
+# In-process cache for the OpenRouter models list. The list rarely changes; one
+# hour is fine. Refreshed lazily on next request after expiry.
+_OPENROUTER_MODELS_CACHE: dict[str, object] = {"data": None, "expires_at": 0.0}
+_OPENROUTER_MODELS_TTL = 3600.0
+
+
+@app.get("/openrouter-models")
+async def list_openrouter_models(current_user: User = Depends(get_current_user)) -> dict:
+    """Proxy + cache OpenRouter's public models list so the builder can show a
+    searchable picker. Returns the OpenRouter response shape with `data`: list
+    of {id, name, context_length, pricing, ...}."""
+    now = time.monotonic()
+    cached = _OPENROUTER_MODELS_CACHE.get("data")
+    expires_at = float(_OPENROUTER_MODELS_CACHE.get("expires_at", 0.0))
+    if cached is not None and now < expires_at:
+        return {"data": cached, "cached": True}
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get("https://openrouter.ai/api/v1/models")
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        # On error, fall back to whatever we cached previously (even if stale).
+        if cached is not None:
+            return {"data": cached, "cached": True, "stale": True, "error": str(exc)}
+        raise HTTPException(status_code=502, detail=f"OpenRouter models fetch failed: {exc}") from exc
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        data = []
+
+    _OPENROUTER_MODELS_CACHE["data"] = data
+    _OPENROUTER_MODELS_CACHE["expires_at"] = now + _OPENROUTER_MODELS_TTL
+    return {"data": data, "cached": False}
 
 
 @app.get("/health/db")

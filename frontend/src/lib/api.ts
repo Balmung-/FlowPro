@@ -30,7 +30,8 @@ export type TemplateNodeConfig = {
   id: string;
   name: string;
   type: TemplateNodeType;
-  model_profile: string | null;
+  model?: string | null;
+  model_profile?: string | null;
   system_prompt: string;
   user_prompt_template: string;
   reads: string[];
@@ -41,6 +42,25 @@ export type TemplateNodeConfig = {
     state_key: string;
   };
   mock_content?: unknown;
+};
+
+export type OpenRouterModel = {
+  id: string;
+  name?: string;
+  description?: string;
+  context_length?: number;
+  pricing?: {
+    prompt?: string;
+    completion?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+};
+
+export type OpenRouterModelsResponse = {
+  data: OpenRouterModel[];
+  cached?: boolean;
+  stale?: boolean;
 };
 
 export type TemplateConfig = {
