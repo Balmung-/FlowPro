@@ -581,12 +581,34 @@ function NodePropertiesPanel({
 }) {
   const isAi = node.type === "ai" || node.type === "plan";
   const isPdf = node.type === "pdf_generator";
+  const userPromptRef = useRef<HTMLTextAreaElement | null>(null);
   const toggleRead = (ref: string) => {
     if (readOnly) return;
     const next = new Set(node.reads);
     if (next.has(ref)) next.delete(ref);
     else next.add(ref);
     onChange({ reads: Array.from(next) });
+  };
+
+  const insertIntoUserPrompt = (variable: string) => {
+    if (readOnly) return;
+    const current = node.user_prompt_template ?? "";
+    const textarea = userPromptRef.current;
+    if (!textarea) {
+      onChange({ user_prompt_template: `${current}${variable}` });
+      return;
+    }
+    const start = textarea.selectionStart ?? current.length;
+    const end = textarea.selectionEnd ?? current.length;
+    const next = current.slice(0, start) + variable + current.slice(end);
+    onChange({ user_prompt_template: next });
+    requestAnimationFrame(() => {
+      const ta = userPromptRef.current;
+      if (!ta) return;
+      const pos = start + variable.length;
+      ta.focus();
+      ta.setSelectionRange(pos, pos);
+    });
   };
 
   // Resolve the displayed model id: direct `model` wins, else look up the profile's primary.
@@ -691,14 +713,22 @@ function NodePropertiesPanel({
 
             <Field
               label="User prompt template"
-              hint="The actual message sent to the model. Inject runtime data with placeholders: ${message} = the user's chat input, ${uploaded_files} = JSON list of project uploads, ${working_intent} (or any ${section_key}) = output from a node you declared in Reads."
+              hint="The actual message sent to the model. Use the buttons below to drop in runtime values; you can still type or edit anything by hand."
             >
-              <textarea
-                className="min-h-[120px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs"
-                value={node.user_prompt_template}
-                readOnly={readOnly}
-                onChange={(event) => onChange({ user_prompt_template: event.target.value })}
-              />
+              <div className="space-y-2">
+                <VariablePicker
+                  reads={node.reads}
+                  disabled={readOnly}
+                  onInsert={insertIntoUserPrompt}
+                />
+                <textarea
+                  ref={userPromptRef}
+                  className="min-h-[120px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs"
+                  value={node.user_prompt_template}
+                  readOnly={readOnly}
+                  onChange={(event) => onChange({ user_prompt_template: event.target.value })}
+                />
+              </div>
             </Field>
           </>
         ) : null}
@@ -802,6 +832,71 @@ function NodePropertiesPanel({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+type VariableChoice = { variable: string; label: string; tone: "neutral" | "blue" };
+
+function VariablePicker({
+  reads,
+  onInsert,
+  disabled,
+}: {
+  reads: string[];
+  onInsert: (variable: string) => void;
+  disabled?: boolean;
+}) {
+  const runtimeVars: VariableChoice[] = [
+    { variable: "${message}", label: "User's message", tone: "neutral" },
+    { variable: "${message_short}", label: "User's message (short)", tone: "neutral" },
+    { variable: "${uploaded_files}", label: "Uploaded files", tone: "neutral" },
+  ];
+  const readVars: VariableChoice[] = reads.map((ref) => ({
+    variable: `\${${ref.replace(/\./g, "_")}}`,
+    label: ref,
+    tone: "blue",
+  }));
+  const all: VariableChoice[] = [...runtimeVars, ...readVars];
+
+  const buttonClass = (tone: VariableChoice["tone"]) =>
+    clsx(
+      "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition disabled:opacity-50",
+      tone === "blue"
+        ? "border-blue-200 bg-blue-50 text-blue-800 hover:bg-blue-100"
+        : "border-slate-200 bg-white text-slate-700 hover:bg-slate-100"
+    );
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+          Insert variable
+        </p>
+        <p className="text-[10px] text-slate-400">Click to drop into the prompt at the cursor.</p>
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-1.5">
+        {all.map((v) => (
+          <button
+            key={v.variable}
+            type="button"
+            className={buttonClass(v.tone)}
+            disabled={disabled}
+            title={`Inserts ${v.variable}`}
+            // preventDefault on mousedown keeps focus on the textarea so the cursor
+            // position is preserved across the click.
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => onInsert(v.variable)}
+          >
+            <span aria-hidden>+</span> {v.label}
+          </button>
+        ))}
+      </div>
+      {readVars.length === 0 ? (
+        <p className="mt-1.5 text-[10px] italic text-slate-400">
+          Tick a Read above to make an upstream node's output available here too.
+        </p>
+      ) : null}
     </div>
   );
 }
