@@ -202,16 +202,29 @@ async def list_openrouter_models(current_user: User = Depends(get_current_user))
     if cached is not None and now < expires_at:
         return {"data": cached, "cached": True}
 
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "FlowPro/1.0 (+https://github.com/Balmung-/FlowPro)",
+    }
+    if settings.openrouter_api_key:
+        # The /models endpoint is public, but sending a key never hurts and may
+        # avoid rate-limit surprises.
+        headers["Authorization"] = f"Bearer {settings.openrouter_api_key}"
+
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get("https://openrouter.ai/api/v1/models")
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = await client.get(
+                "https://openrouter.ai/api/v1/models",
+                headers=headers,
+            )
             response.raise_for_status()
             payload = response.json()
     except Exception as exc:
         # On error, fall back to whatever we cached previously (even if stale).
+        detail = f"OpenRouter models fetch failed: {type(exc).__name__}: {exc}"
         if cached is not None:
-            return {"data": cached, "cached": True, "stale": True, "error": str(exc)}
-        raise HTTPException(status_code=502, detail=f"OpenRouter models fetch failed: {exc}") from exc
+            return {"data": cached, "cached": True, "stale": True, "error": detail}
+        raise HTTPException(status_code=502, detail=detail) from exc
 
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):

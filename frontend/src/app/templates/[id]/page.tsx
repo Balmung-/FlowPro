@@ -50,7 +50,11 @@ function defaultNode(type: TemplateNodeType, existingIds: Set<string>): Template
       model: "openai/o3-mini",
       system_prompt:
         "You are the planning node. Produce a concise plantodo.md before any execution node acts.",
-      user_prompt_template: "User request:\n${message}\n\nUploaded files:\n${uploaded_files}",
+      instruction:
+        "Produce a concise plantodo.md covering Goal, Current Understanding, Files Likely Involved, Structural Decision, Execution Steps, Risks, What Not To Do, and Completion Criteria. Output markdown only.",
+      include_message: true,
+      include_uploaded_files: true,
+      user_prompt_template: "",
       reads: [],
       output: {
         format: "markdown",
@@ -67,6 +71,9 @@ function defaultNode(type: TemplateNodeType, existingIds: Set<string>): Template
       name: "PDF Generator",
       type: "pdf_generator",
       system_prompt: "",
+      instruction: "",
+      include_message: false,
+      include_uploaded_files: false,
       user_prompt_template: "",
       reads: [],
       output: {
@@ -85,7 +92,10 @@ function defaultNode(type: TemplateNodeType, existingIds: Set<string>): Template
     type: "ai",
     model: "anthropic/claude-3.5-sonnet",
     system_prompt: "",
-    user_prompt_template: "User message:\n${message}",
+    instruction: "Describe what this AI node should do.",
+    include_message: true,
+    include_uploaded_files: false,
+    user_prompt_template: "",
     reads: [],
     output: {
       format: "markdown",
@@ -120,9 +130,27 @@ export default function TemplateBuilderPage() {
   const [info, setInfo] = useState<string | null>(null);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([]);
   const [openRouterModels, setOpenRouterModels] = useState<OpenRouterModel[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
 
   const isSeeded = template?.is_seeded === true;
   const readOnly = isSeeded;
+
+  const loadOpenRouterModels = useCallback(async () => {
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const res = await apiFetch<OpenRouterModelsResponse>("/openrouter-models");
+      setOpenRouterModels(res.data ?? []);
+      if ((res.data ?? []).length === 0) {
+        setModelsError("OpenRouter returned an empty catalog.");
+      }
+    } catch (err) {
+      setModelsError(err instanceof Error ? err.message : "Failed to load OpenRouter catalog.");
+    } finally {
+      setModelsLoading(false);
+    }
+  }, []);
 
   // Bootstrap: auth + load
   useEffect(() => {
@@ -133,9 +161,7 @@ export default function TemplateBuilderPage() {
     apiFetch<ModelProfilesResponse>("/model-profiles")
       .then((res) => setModelProfiles(res.profiles))
       .catch(() => undefined);
-    apiFetch<OpenRouterModelsResponse>("/openrouter-models")
-      .then((res) => setOpenRouterModels(res.data ?? []))
-      .catch(() => undefined);
+    void loadOpenRouterModels();
 
     if (isNew) {
       setConfig({ ...EMPTY_CONFIG, nodes: [] });
@@ -262,6 +288,25 @@ export default function TemplateBuilderPage() {
       const next = [...current.nodes];
       const [removed] = next.splice(idx, 1);
       next.splice(target, 0, removed);
+      return { ...current, nodes: next };
+    });
+    setDirty(true);
+  }, []);
+
+  // Drag-to-reorder: when a node is dropped, infer its new index from its x position
+  // (canvas spacing is 280px between successive nodes) and splice the array.
+  const handleNodeDragStop = useCallback((_event: unknown, draggedNode: Node) => {
+    const NODE_SPACING = 280;
+    const droppedX = draggedNode.position?.x ?? 0;
+    setConfig((current) => {
+      const fromIndex = current.nodes.findIndex((n) => n.id === draggedNode.id);
+      if (fromIndex < 0) return current;
+      let toIndex = Math.round(droppedX / NODE_SPACING);
+      toIndex = Math.max(0, Math.min(current.nodes.length - 1, toIndex));
+      if (fromIndex === toIndex) return current;
+      const next = [...current.nodes];
+      const [removed] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, removed);
       return { ...current, nodes: next };
     });
     setDirty(true);
@@ -427,7 +472,7 @@ export default function TemplateBuilderPage() {
               + PDF Generator
             </button>
             <span className="ml-auto text-[10px] text-slate-400">
-              Edges are drawn from node order. Reads declare data dependencies.
+              Drag a node left/right to reorder. Edges follow the order. Reads declare data dependencies.
             </span>
           </div>
           <div className="flex-1">
@@ -442,7 +487,8 @@ export default function TemplateBuilderPage() {
                 fitView
                 fitViewOptions={{ padding: 0.2 }}
                 onNodeClick={(_, node) => setSelectedNodeId(node.id)}
-                nodesDraggable={false}
+                onNodeDragStop={handleNodeDragStop}
+                nodesDraggable={!readOnly}
                 nodesConnectable={false}
                 elementsSelectable
                 proOptions={{ hideAttribution: true }}
@@ -462,6 +508,9 @@ export default function TemplateBuilderPage() {
               upstreamReadOptions={upstreamReadOptions}
               modelProfiles={modelProfiles}
               openRouterModels={openRouterModels}
+              modelsLoading={modelsLoading}
+              modelsError={modelsError}
+              onRetryModels={() => void loadOpenRouterModels()}
               readOnly={readOnly}
               isFirst={config.nodes[0]?.id === selectedNode.id}
               isLast={config.nodes[config.nodes.length - 1]?.id === selectedNode.id}
@@ -557,6 +606,9 @@ function NodePropertiesPanel({
   upstreamReadOptions,
   modelProfiles,
   openRouterModels,
+  modelsLoading,
+  modelsError,
+  onRetryModels,
   readOnly,
   isFirst,
   isLast,
@@ -570,6 +622,9 @@ function NodePropertiesPanel({
   upstreamReadOptions: string[];
   modelProfiles: ModelProfile[];
   openRouterModels: OpenRouterModel[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+  onRetryModels: () => void;
   readOnly: boolean;
   isFirst: boolean;
   isLast: boolean;
@@ -692,44 +747,106 @@ function NodePropertiesPanel({
                 disabled={readOnly}
                 onChange={(modelId) => onChange({ model: modelId, model_profile: null })}
               />
-              {!openRouterModels.length ? (
+              {modelsError ? (
+                <div className="mt-1 flex items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] text-amber-800">
+                  <span>Catalog unavailable: {modelsError}</span>
+                  <button
+                    type="button"
+                    className="rounded border border-amber-300 bg-white px-2 py-0.5 text-[10px] font-semibold text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+                    disabled={modelsLoading}
+                    onClick={onRetryModels}
+                  >
+                    {modelsLoading ? "Retrying…" : "Retry"}
+                  </button>
+                </div>
+              ) : null}
+              {modelsLoading && !openRouterModels.length ? (
+                <p className="mt-1 text-[10px] italic text-slate-400">Loading OpenRouter catalog…</p>
+              ) : null}
+              {!modelsLoading && !modelsError && openRouterModels.length > 0 ? (
                 <p className="mt-1 text-[10px] italic text-slate-400">
-                  Loading the OpenRouter catalog… you can still type any model id manually.
+                  {openRouterModels.length} models loaded. You can also type any custom model id.
                 </p>
               ) : null}
             </Field>
 
             <Field
-              label="System prompt"
-              hint="Persistent instructions sent to the model on every call (e.g., 'You are a careful proposal writer. Only output markdown.')."
+              label="What this node should do"
+              hint="The task this node performs, in plain English. Describe the outcome and any output format expectations."
             >
               <textarea
-                className="min-h-[80px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-                value={node.system_prompt}
+                className="min-h-[110px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+                placeholder="e.g. Extract the user's intent into JSON with these keys: document_type, target_audience, goal, tone, requested_outputs, missing_information."
+                value={node.instruction ?? ""}
                 readOnly={readOnly}
-                onChange={(event) => onChange({ system_prompt: event.target.value })}
+                onChange={(event) => onChange({ instruction: event.target.value })}
               />
             </Field>
 
             <Field
-              label="User prompt template"
-              hint="The actual message sent to the model. Use the buttons below to drop in runtime values; you can still type or edit anything by hand."
+              label="Include in context"
+              hint="What runtime data this node should see when it runs. The system formats it for you — no placeholders needed."
             >
-              <div className="space-y-2">
-                <VariablePicker
-                  reads={node.reads}
+              <div className="space-y-1.5">
+                <ToggleRow
+                  checked={node.include_message ?? true}
                   disabled={readOnly}
-                  onInsert={insertIntoUserPrompt}
+                  onChange={(value) => onChange({ include_message: value })}
+                  label="User's chat message"
+                  description="The text the user typed in the chat composer."
                 />
-                <textarea
-                  ref={userPromptRef}
-                  className="min-h-[120px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs"
-                  value={node.user_prompt_template}
-                  readOnly={readOnly}
-                  onChange={(event) => onChange({ user_prompt_template: event.target.value })}
+                <ToggleRow
+                  checked={node.include_uploaded_files ?? false}
+                  disabled={readOnly}
+                  onChange={(value) => onChange({ include_uploaded_files: value })}
+                  label="Uploaded files"
+                  description="A JSON list of files uploaded to the project (paths and filenames, not contents)."
                 />
+                {upstreamReadOptions.length > 0 ? (
+                  <p className="pt-1 text-[10px] text-slate-500">
+                    Upstream node outputs are picked in <span className="font-semibold">Reads</span> below.
+                  </p>
+                ) : null}
               </div>
             </Field>
+
+            <details className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
+              <summary className="cursor-pointer select-none font-semibold text-slate-600">
+                Advanced (system prompt + raw template)
+              </summary>
+              <div className="mt-3 space-y-3">
+                <Field
+                  label="System prompt"
+                  hint="Persistent role/persona for the AI. Optional. (e.g., 'You are a careful proposal writer. Output only markdown.')"
+                >
+                  <textarea
+                    className="min-h-[80px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+                    value={node.system_prompt}
+                    readOnly={readOnly}
+                    onChange={(event) => onChange({ system_prompt: event.target.value })}
+                  />
+                </Field>
+                <Field
+                  label="Raw user prompt template (legacy)"
+                  hint="Power-user override. If both this and the structured 'What this node should do' are set, the structured version wins. Uses ${var} placeholders."
+                >
+                  <div className="space-y-2">
+                    <VariablePicker
+                      reads={node.reads}
+                      disabled={readOnly}
+                      onInsert={insertIntoUserPrompt}
+                    />
+                    <textarea
+                      ref={userPromptRef}
+                      className="min-h-[100px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs"
+                      value={node.user_prompt_template ?? ""}
+                      readOnly={readOnly}
+                      onChange={(event) => onChange({ user_prompt_template: event.target.value })}
+                    />
+                  </div>
+                </Field>
+              </div>
+            </details>
           </>
         ) : null}
 
@@ -918,6 +1035,44 @@ function Field({
       <div className="mt-1">{children}</div>
       {hint ? <p className="mt-1 text-[10px] text-slate-400">{hint}</p> : null}
     </div>
+  );
+}
+
+function ToggleRow({
+  checked,
+  disabled,
+  onChange,
+  label,
+  description,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (value: boolean) => void;
+  label: string;
+  description?: string;
+}) {
+  return (
+    <label
+      className={clsx(
+        "flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 transition",
+        checked ? "border-blue-300 bg-blue-50/60" : "border-slate-200 bg-white hover:bg-slate-50",
+        disabled && "cursor-not-allowed opacity-60"
+      )}
+    >
+      <input
+        type="checkbox"
+        className="mt-0.5"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-semibold text-slate-800">{label}</div>
+        {description ? (
+          <div className="mt-0.5 text-[10px] text-slate-500">{description}</div>
+        ) : null}
+      </div>
+    </label>
   );
 }
 

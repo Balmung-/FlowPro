@@ -33,6 +33,13 @@ export type TemplateNodeConfig = {
   model?: string | null;
   model_profile?: string | null;
   system_prompt: string;
+  /** Structured task description in plain English. Preferred over user_prompt_template. */
+  instruction?: string;
+  /** Auto-include the user's chat message in the prompt context. */
+  include_message?: boolean;
+  /** Auto-include the uploaded files list in the prompt context. */
+  include_uploaded_files?: boolean;
+  /** Legacy free-form prompt template using ${var} placeholders. */
   user_prompt_template: string;
   reads: string[];
   output: {

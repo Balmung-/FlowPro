@@ -95,6 +95,18 @@ def validate_template_config(config: dict[str, Any]) -> None:
                     status_code=400,
                     detail=f"Node {node_id} must specify either 'model' (OpenRouter id) or 'model_profile'.",
                 )
+            # The node's task: either a plain `instruction` string (preferred) or a
+            # legacy `user_prompt_template` with ${var} placeholders. At least one is required.
+            instruction = node.get("instruction")
+            user_prompt_template = node.get("user_prompt_template")
+            if not (
+                (isinstance(instruction, str) and instruction.strip())
+                or (isinstance(user_prompt_template, str) and user_prompt_template.strip())
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Node {node_id} must specify an `instruction` describing what it should do.",
+                )
 
         output = node.get("output")
         if not isinstance(output, dict):
@@ -777,6 +789,46 @@ class WorkflowService:
             "cost_estimate": 0.0,
         }
 
+    def _build_structured_user_prompt(
+        self,
+        node_config: dict[str, Any],
+        message: str,
+        uploaded_files: list[Artifact],
+        run_context: dict[str, str],
+    ) -> str:
+        """Assemble the user prompt from the node's structured `instruction` field
+        plus toggled context blocks (message, uploaded files, declared reads).
+
+        This is the preferred path for new nodes — users describe what the node
+        should do in plain English and tick which context to include. The runner
+        does the formatting so users never need to write ${var} placeholders.
+        """
+        sections: list[str] = []
+        include_message = node_config.get("include_message", True)
+        include_uploaded_files = node_config.get("include_uploaded_files", False)
+
+        if include_message and message:
+            sections.append(f"USER REQUEST:\n{message}")
+
+        if include_uploaded_files:
+            files_text = json.dumps(
+                [{"path": item.path, "filename": item.filename} for item in uploaded_files],
+                indent=2,
+            )
+            sections.append(f"UPLOADED FILES:\n{files_text}")
+
+        for ref in node_config.get("reads", []):
+            value = run_context.get(ref)
+            if not value:
+                continue
+            sections.append(f"{ref.upper()} (from upstream node):\n{value}")
+
+        instruction = (node_config.get("instruction") or "").strip()
+        if instruction:
+            sections.append(f"YOUR TASK:\n{instruction}")
+
+        return "\n\n".join(sections)
+
     async def _run_ai_node(
         self,
         db: AsyncSession,
@@ -794,8 +846,16 @@ class WorkflowService:
 
         sub_context = self._build_substitution_context(message, uploaded_files, run_context)
         system_prompt = node_config.get("system_prompt", "") or ""
-        user_prompt_template = node_config.get("user_prompt_template", "") or ""
-        user_prompt = string.Template(user_prompt_template).safe_substitute(sub_context)
+        # Prefer the structured `instruction` field. Fall back to the legacy
+        # `user_prompt_template` with ${var} substitutions for older configs.
+        instruction = (node_config.get("instruction") or "").strip()
+        if instruction:
+            user_prompt = self._build_structured_user_prompt(
+                node_config, message, uploaded_files, run_context
+            )
+        else:
+            user_prompt_template = node_config.get("user_prompt_template", "") or ""
+            user_prompt = string.Template(user_prompt_template).safe_substitute(sub_context)
 
         output_format = node_config["output"]["format"]
         expect_json = output_format == "json"

@@ -11,24 +11,23 @@ Node config schema (linear v1):
         # AI/plan nodes need either `model` (preferred) or `model_profile` (legacy):
         "model": str | None,           # direct OpenRouter model id, e.g. "anthropic/claude-3.5-sonnet"
         "model_profile": str | None,   # legacy fallback bundle; resolves to settings.model_profiles[slug]
-        "system_prompt": str,          # for ai/plan only
-        "user_prompt_template": str,   # uses ${var} substitutions, for ai/plan only
-        "reads": [str],                # state references like "working.intent" — value injected as ${working_intent}
+        "system_prompt": str,          # persistent role/persona for the AI (optional)
+        # User prompt: structured form (preferred) — `instruction` describes what the
+        # node should do, plus tick boxes that auto-include context. Legacy form
+        # uses `user_prompt_template` with ${var} placeholders.
+        "instruction": str,            # preferred — the task in plain English
+        "include_message": bool,       # auto-include the user's chat message (default True)
+        "include_uploaded_files": bool,# auto-include the uploaded files list (default False)
+        "user_prompt_template": str,   # legacy fallback; uses ${var} substitutions
+        "reads": [str],                # state references like "working.intent" — auto-injected as a context block
         "output": {
             "format": "json" | "markdown" | "pdf",
             "path": str,               # project-relative, must start with allowed prefix
-            "state_section": str,      # "working" | "final" | etc
+            "state_section": str,
             "state_key": str
         },
         "mock_content": Any            # optional; strings/dicts/lists walked for ${var} substitution in MOCK_AI mode
     }
-
-Substitution variables available to all nodes:
-    ${message}           — user's request
-    ${message_short}     — first 160 chars of message
-    ${message_no_period} — message with trailing period stripped
-    ${uploaded_files}    — JSON string of uploaded files list
-    ${<section>_<key>}   — for each declared read, the prior node's output rendered as a string
 """
 from __future__ import annotations
 
@@ -46,7 +45,9 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "type": "ai",
             "model": "openai/gpt-4o-mini",
             "system_prompt": "Extract the user's document-generation intent into the required JSON shape. Always return the requested keys.",
-            "user_prompt_template": "User message:\n${message}\n\nUploaded files:\n${uploaded_files}\n\nReturn JSON with keys: document_type, target_audience, goal, tone, requested_outputs, missing_information.",
+            "instruction": "Return JSON with these keys: document_type, target_audience, goal, tone, requested_outputs, missing_information.",
+            "include_message": True,
+            "include_uploaded_files": True,
             "reads": [],
             "output": {
                 "format": "json",
@@ -69,7 +70,9 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "type": "ai",
             "model": "openai/gpt-4.1-mini",
             "system_prompt": "Extract concrete requirements, constraints, must_include, must_avoid, and source_notes. Return only valid JSON.",
-            "user_prompt_template": "User message:\n${message}\n\nUploaded files:\n${uploaded_files}\n\nIntent JSON:\n${working_intent}",
+            "instruction": "Using the user's request and the parsed intent above, extract concrete requirements. Return JSON with these keys: requirements, constraints, must_include, must_avoid, source_notes.",
+            "include_message": True,
+            "include_uploaded_files": True,
             "reads": ["working.intent"],
             "output": {
                 "format": "json",
@@ -106,7 +109,9 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "type": "ai",
             "model": "anthropic/claude-3.5-sonnet",
             "system_prompt": "Write a strong markdown outline for the requested document. Use structure, headings, and bullets. Do not write the full document.",
-            "user_prompt_template": "User message:\n${message}\n\nIntent JSON:\n${working_intent}\n\nRequirements JSON:\n${working_requirements}",
+            "instruction": "Build a well-structured markdown outline for the document the user wants. Return only the outline (headings + bullets), not the full document.",
+            "include_message": True,
+            "include_uploaded_files": False,
             "reads": ["working.intent", "working.requirements"],
             "output": {
                 "format": "markdown",
@@ -122,7 +127,9 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "type": "ai",
             "model": "anthropic/claude-3.5-sonnet",
             "system_prompt": "Write the complete markdown draft using the outline and every extracted requirement.",
-            "user_prompt_template": "User message:\n${message}\n\nIntent JSON:\n${working_intent}\n\nRequirements JSON:\n${working_requirements}\n\nOutline Markdown:\n${working_outline}",
+            "instruction": "Expand the outline into a full markdown draft. Cover every section. Honor every requirement and constraint.",
+            "include_message": True,
+            "include_uploaded_files": False,
             "reads": ["working.intent", "working.requirements", "working.outline"],
             "output": {
                 "format": "markdown",
@@ -138,7 +145,9 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "type": "ai",
             "model": "openai/o3-mini",
             "system_prompt": "Audit the draft against the requirements. Return JSON with overall_score, issues, recommended_fixes, and final_instruction.",
-            "user_prompt_template": "User message:\n${message}\n\nRequirements JSON:\n${working_requirements}\n\nDraft Markdown:\n${working_draft}",
+            "instruction": "Audit the draft against the requirements. Return JSON with these keys: overall_score (0-100), issues (list), recommended_fixes (list), final_instruction (string telling the next node what to fix).",
+            "include_message": True,
+            "include_uploaded_files": False,
             "reads": ["working.requirements", "working.draft"],
             "output": {
                 "format": "json",
@@ -164,7 +173,9 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "type": "ai",
             "model": "anthropic/claude-3.5-sonnet",
             "system_prompt": "Revise the draft into the final markdown document. Apply the QA recommendations and final instruction. Produce only markdown.",
-            "user_prompt_template": "User message:\n${message}\n\nRequirements JSON:\n${working_requirements}\n\nDraft Markdown:\n${working_draft}\n\nQA Report JSON:\n${working_qa_report}",
+            "instruction": "Revise the draft into the final document, applying the QA report's recommended fixes and following its final_instruction. Output only markdown.",
+            "include_message": True,
+            "include_uploaded_files": False,
             "reads": ["working.requirements", "working.draft", "working.qa_report"],
             "output": {
                 "format": "markdown",
@@ -178,8 +189,8 @@ DOCUMENT_GENERATOR_CONFIG: dict[str, Any] = {
             "id": "pdf_generator",
             "name": "PDF Generator",
             "type": "pdf_generator",
-            "model_profile": None,
             "system_prompt": "",
+            "instruction": "",
             "user_prompt_template": "",
             "reads": ["final.markdown"],
             "output": {
@@ -199,8 +210,10 @@ def _plan_node() -> dict[str, Any]:
         "name": "Plan",
         "type": "plan",
         "model": "openai/o3-mini",
-        "system_prompt": "You are the planning node. Produce a concise plantodo.md before any execution node acts. Cover Goal, Current Understanding, Files Likely Involved, Structural Decision, Execution Steps, Risks, What Not To Do, and Completion Criteria. Markdown only.",
-        "user_prompt_template": "User request:\n${message}\n\nUploaded files:\n${uploaded_files}\n\nWrite the plantodo.md document.",
+        "system_prompt": "You are the planning node. Produce a concise plantodo.md before any execution node acts.",
+        "instruction": "Produce a concise plantodo.md covering: Goal, Current Understanding, Files Likely Involved, Structural Decision, Execution Steps, Risks, What Not To Do, Completion Criteria. Output markdown only.",
+        "include_message": True,
+        "include_uploaded_files": True,
         "reads": [],
         "output": {
             "format": "markdown",
