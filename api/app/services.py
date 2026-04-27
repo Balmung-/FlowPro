@@ -785,6 +785,11 @@ class WorkflowService:
             },
         )
         db.add(run)
+        # Flush the runs row first so dependent rows (chat_messages,
+        # node_executions) can satisfy their FK on runs.id within this
+        # transaction. SQLAlchemy doesn't always topologically sort inserts
+        # without explicit relationship() declarations on the models.
+        await db.flush()
         db.add(
             ChatMessage(
                 id=generate_id("msg"),
