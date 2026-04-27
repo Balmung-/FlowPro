@@ -1361,7 +1361,7 @@ class WorkflowService:
             if not artifact or artifact.deleted_at is not None:
                 continue
             try:
-            raw = await self.storage.read_artifact(project, artifact)
+                raw = await self.storage.read_artifact(project, artifact)
             except Exception:
                 continue
             try:
