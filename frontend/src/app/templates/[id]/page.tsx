@@ -358,6 +358,23 @@ export default function TemplateBuilderPage() {
         </div>
         <div className="flex items-center gap-2">
           {info ? <span className="text-xs text-emerald-700">{info}</span> : null}
+          {readOnly && template ? (
+            <button
+              className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
+              onClick={async () => {
+                try {
+                  const cloned = await apiFetch<Template>(`/templates/${template.id}/clone`, {
+                    method: "POST",
+                  });
+                  router.push(`/templates/${cloned.id}`);
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : "Clone failed.");
+                }
+              }}
+            >
+              Clone to edit
+            </button>
+          ) : null}
           <button
             className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white shadow-sm disabled:opacity-50"
             disabled={readOnly || saving || !dirty}
