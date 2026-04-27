@@ -26,6 +26,7 @@ import {
 } from "@/lib/api";
 import { clearAuthSession, getStoredToken } from "@/lib/auth";
 import FileExplorerDrawer from "@/components/file-explorer-drawer";
+import DeleteProjectModal from "@/components/delete-project-modal";
 
 const STREAM_EVENT_TYPES = [
   "run.started",
@@ -125,6 +126,7 @@ export default function WorkspacePage() {
   const [explorerOpen, setExplorerOpen] = useState(false);
   const [explorerInitialTab, setExplorerInitialTab] = useState<"project" | "vault">("project");
   const [me, setMe] = useState<User | null>(null);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -965,6 +967,16 @@ export default function WorkspacePage() {
                   Edit nodes
                 </Link>
               ) : null}
+              {selectedProject ? (
+                <button
+                  type="button"
+                  className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-50"
+                  onClick={() => setDeleteModalOpen(true)}
+                  title="Delete this project, its files, and (optionally) the Vault items copied from it"
+                >
+                  Delete project
+                </button>
+              ) : null}
               {selectedRunSummary ? (
                 <span
                   className={clsx(
@@ -1683,6 +1695,23 @@ export default function WorkspacePage() {
         onProjectFilesChanged={() => {
           if (selectedProjectId) {
             void loadProjectData(selectedProjectId, selectedRunId || undefined);
+          }
+        }}
+      />
+
+      <DeleteProjectModal
+        open={deleteModalOpen}
+        project={selectedProject}
+        onClose={() => setDeleteModalOpen(false)}
+        onDeleted={(deletedId) => {
+          setProjects((current) => current.filter((p) => p.id !== deletedId));
+          if (selectedProjectId === deletedId) {
+            setSelectedProjectId("");
+            setSelectedRunId("");
+            setSelectedRun(null);
+            setMessages([]);
+            setFiles([]);
+            setRuns([]);
           }
         }}
       />

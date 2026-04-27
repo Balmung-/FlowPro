@@ -429,30 +429,68 @@ async def update_project(
 @app.delete("/projects/{project_id}")
 async def delete_project(
     project_id: str,
+    cascade_vault: bool = Query(default=False),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Delete a project, all its R2 objects, and optionally any Vault items
+    copied from this project.
+
+    - cascade_vault=false (default): Vault items survive, but their
+      `source_project_id` will dangle (refers to a deleted project).
+    - cascade_vault=true: Vault items where source_project_id matches this
+      project get their R2 objects + DB rows removed too. Other Vault items
+      are untouched.
+
+    Crucially the cascade only touches items the caller owns AND whose
+    source_project_id matches — no other vault rows are affected.
+    """
     project = await get_project_for_user(db, project_id, current_user.id)
+
+    deleted_vault_items = 0
+    vault_storage_warnings: list[str] = []
+    if cascade_vault:
+        result = await db.execute(
+            select(VaultItem).where(
+                VaultItem.user_id == current_user.id,
+                VaultItem.source_project_id == project_id,
+            )
+        )
+        items = list(result.scalars().all())
+        for item in items:
+            try:
+                await storage_service.delete_vault_object(item.storage_key)
+            except Exception as exc:
+                vault_storage_warnings.append(f"{item.id}: {exc}")
+            await db.delete(item)
+            deleted_vault_items += 1
+        if items:
+            await db.flush()
+
     # Wipe the R2 tree first so we don't leak storage. The DB rows (runs,
     # node_executions, run_events, chat_messages, artifacts) cascade via FKs
     # when the project row is deleted.
     deleted_objects = 0
+    storage_warning: str | None = None
     try:
         deleted_objects = await storage_service.delete_project_tree(project)
     except Exception as exc:
-        # Don't block deletion of the DB row if the storage cleanup partially fails;
-        # the user can re-run cleanup later. Surface the error in the response.
-        await db.delete(project)
-        await db.commit()
-        return {
-            "deleted": True,
-            "project_id": project_id,
-            "deleted_objects": deleted_objects,
-            "storage_warning": f"Storage cleanup partial: {exc}",
-        }
+        storage_warning = f"Project storage cleanup partial: {exc}"
+
     await db.delete(project)
     await db.commit()
-    return {"deleted": True, "project_id": project_id, "deleted_objects": deleted_objects}
+
+    response: dict = {
+        "deleted": True,
+        "project_id": project_id,
+        "deleted_objects": deleted_objects,
+        "deleted_vault_items": deleted_vault_items,
+    }
+    if storage_warning:
+        response["storage_warning"] = storage_warning
+    if vault_storage_warnings:
+        response["vault_storage_warnings"] = vault_storage_warnings
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1001,7 @@ async def delete_artifact(
 async def list_vault_items(
     folder: str | None = Query(default=None),
     search: str | None = Query(default=None),
+    source_project_id: str | None = Query(default=None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
@@ -973,6 +1012,10 @@ async def list_vault_items(
     if search:
         like = f"%{search.strip()}%"
         statement = statement.where(VaultItem.name.ilike(like))
+    if source_project_id:
+        # Used by the delete-project modal to enumerate vault items copied
+        # from a specific project so the user can opt-in to cascading delete.
+        statement = statement.where(VaultItem.source_project_id == source_project_id)
     statement = statement.order_by(desc(VaultItem.created_at))
     result = await db.execute(statement)
     return [serialize_vault_item(item) for item in result.scalars().all()]
