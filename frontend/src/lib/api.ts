@@ -100,6 +100,14 @@ export async function apiFetch<T>(path: string, init?: RequestInit, tokenOverrid
   });
   if (!response.ok) {
     const body = await response.text();
+    let detail: string | null = null;
+    try {
+      const parsed = JSON.parse(body) as { detail?: string };
+      detail = parsed.detail ?? null;
+    } catch {}
+    if (detail) {
+      throw new Error(detail);
+    }
     throw new Error(body || `Request failed: ${response.status}`);
   }
   return response.json() as Promise<T>;

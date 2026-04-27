@@ -1,14 +1,11 @@
 import { NextRequest } from "next/server";
 
-const UPSTREAM_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+import { getApiServerBaseUrl } from "@/lib/server-api-base";
+
 export const dynamic = "force-dynamic";
 
 function buildUpstreamUrl(path: string[], request: NextRequest): string {
-  if (!UPSTREAM_BASE) {
-    throw new Error("NEXT_PUBLIC_API_BASE_URL is not configured for the frontend runtime.");
-  }
-
-  const upstream = new URL(`${UPSTREAM_BASE.replace(/\/+$/, "")}/${path.join("/")}`);
+  const upstream = new URL(`${getApiServerBaseUrl()}/${path.join("/")}`);
   request.nextUrl.searchParams.forEach((value, key) => {
     upstream.searchParams.append(key, value);
   });
