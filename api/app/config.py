@@ -20,14 +20,17 @@ class Settings(BaseSettings):
     bootstrap_admin_name: str | None = None
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
+    # Defaults intentionally favor OpenAI ids that are universally available
+    # on OpenRouter; users can override any of these via env vars and the
+    # template builder lets per-node `model` values override the profile entirely.
     fast_classifier_model: str = "openai/gpt-4o-mini"
-    fast_classifier_fallback_model: str = "anthropic/claude-3-haiku"
-    json_extractor_model: str = "openai/gpt-4.1-mini"
-    json_extractor_fallback_model: str = "google/gemini-flash-1.5"
-    premium_writer_model: str = "anthropic/claude-3.5-sonnet"
-    premium_writer_fallback_model: str = "openai/gpt-4.1"
-    deep_reasoner_model: str = "openai/o3-mini"
-    deep_reasoner_fallback_model: str = "anthropic/claude-3.7-sonnet"
+    fast_classifier_fallback_model: str = "openai/gpt-4o-mini"
+    json_extractor_model: str = "openai/gpt-4o-mini"
+    json_extractor_fallback_model: str = "openai/gpt-4o"
+    premium_writer_model: str = "openai/gpt-4o"
+    premium_writer_fallback_model: str = "openai/gpt-4o-mini"
+    deep_reasoner_model: str = "openai/gpt-4o"
+    deep_reasoner_fallback_model: str = "openai/gpt-4o-mini"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -49,9 +52,10 @@ class Settings(BaseSettings):
 
 
 MODEL_PRICING_PER_MILLION = {
+    "openai/gpt-4o": {"input": 2.5, "output": 10.0},
     "openai/gpt-4o-mini": {"input": 0.15, "output": 0.6},
-    "openai/gpt-4.1-mini": {"input": 0.4, "output": 1.6},
     "openai/gpt-4.1": {"input": 2.0, "output": 8.0},
+    "openai/gpt-4.1-mini": {"input": 0.4, "output": 1.6},
     "openai/o3-mini": {"input": 1.1, "output": 4.4},
     "anthropic/claude-3-haiku": {"input": 0.25, "output": 1.25},
     "anthropic/claude-3.5-sonnet": {"input": 3.0, "output": 15.0},
